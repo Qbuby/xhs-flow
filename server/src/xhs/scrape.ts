@@ -8,6 +8,12 @@ import {
   fetchHtml,
   takeEndpointFailures,
 } from './api.js';
+import {
+  harvestNoteList,
+  harvestedProfile,
+  readNotePage,
+  toScrapedNote,
+} from './scrape-browser.js';
 import { logger } from '../logger.js';
 import { logEvent, run, all, get, transaction } from '../db/index.js';
 import { parseInitialState, extractTags } from '../util/text.js';
@@ -405,7 +411,7 @@ async function extractPalette(buf: Buffer): Promise<Array<{ hex: string; weight:
 function indexNoteFts(notePk: number, title: string, desc: string, tags: string[]): void {
   transaction(() => {
     run('DELETE FROM notes_fts WHERE rowid = ?', notePk);
-    run('DELETE FROM notes_fts_map WHERE noteid = ?', notePk);
+    run('DELETE FROM notes_fts_map WHERE rowid = ?', notePk);
     run(
       'INSERT INTO notes_fts(rowid, title, desc, tags) VALUES (?, ?, ?, ?)',
       notePk,
@@ -472,44 +478,77 @@ export async function scrapeAuthor(opts: ScrapeOptions): Promise<ScrapeResult> {
     usedVia.push('signed-api:user');
   } else {
     run("UPDATE sources SET user_id = ?, updated_at = datetime('now') WHERE id = ?", userId, sourceId);
-    logEvent('fallback', '作者信息接口不可用，降级到 SSR 解析', { severity: 'info' });
+    logEvent('fallback', '作者信息接口不可用（签名被拒），改用页面采集', { severity: 'info' });
   }
 
-  /* --- 2. 列出全部笔记（多级降级）--- */
+  /* --- 2. 列出全部笔记 ---
+   *
+   * 优先走「让页面自己请求、我们只读响应」：实测同一个端点、同一份登录态、
+   * 同一个浏览器，页面自己发 success=true notes=30，我们自己发就是 300011。
+   * 小红书明显在区分「谁发的请求」，那就别跟签名较劲，让页面像真人一样去拉。
+   */
   let listed: ListedNote[] | null = null;
   const attempts: string[] = [];
 
-  const viaApi = await listNotesViaApi(userId, xsecToken, maxNotes, onProgress).catch((err) => {
-    attempts.push(`签名 API 抛错：${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  });
-  if (viaApi && viaApi.length > 0) {
-    listed = viaApi;
-    usedVia.push('signed-api:user_posted');
-  } else {
-    attempts.push(...takeEndpointFailures());
-    logEvent('fallback', '笔记列表 API 不可用，降级到 SSR 页面解析', { severity: 'warn' });
+  try {
+    const harvested = await harvestNoteList(userId, maxNotes, (n) =>
+      onProgress({ phase: 'list', done: n, total: maxNotes }),
+    );
+    listed = harvested.map((h) => ({ noteId: h.noteId, xsecToken: h.xsecToken }));
+    usedVia.push('browser:harvest');
 
-    const viaSsr = await listNotesViaSsr(userId).catch((err) => {
-      attempts.push(`SSR 抛错：${err instanceof Error ? err.message : String(err)}`);
+    // 作者资料也从页面响应里顺带采一份 —— 直接调 API 那条路会被签名拒掉
+    const hp = harvestedProfile();
+    if (hp.nickname || hp.redId) {
+      run(
+        `UPDATE sources SET nickname = COALESCE(?, nickname), avatar_url = COALESCE(?, avatar_url),
+           red_id = COALESCE(?, red_id), user_id = COALESCE(?, user_id), updated_at = datetime('now')
+         WHERE id = ?`,
+        hp.nickname,
+        hp.avatar,
+        hp.redId,
+        hp.redId,
+        sourceId,
+      );
+    }
+  } catch (err) {
+    attempts.push(`页面采集失败：${err instanceof Error ? err.message : String(err)}`);
+    logEvent('fallback', '页面采集不可用，降级到直接调 API', { severity: 'warn' });
+  }
+
+  if (!listed || listed.length === 0) {
+    const viaApi = await listNotesViaApi(userId, xsecToken, maxNotes, onProgress).catch((err) => {
+      attempts.push(`签名 API 抛错：${err instanceof Error ? err.message : String(err)}`);
       return null;
     });
-    if (viaSsr && viaSsr.length > 0) {
-      listed = viaSsr;
-      usedVia.push('ssr:initial-state');
+    if (viaApi && viaApi.length > 0) {
+      listed = viaApi;
+      usedVia.push('signed-api:user_posted');
     } else {
-      attempts.push('SSR 页面里没找到作品列表（可能被风控替换成错误页）');
-      logEvent('fallback', 'SSR 也没拿到作品列表，降级到滚动页面', { severity: 'warn' });
+      attempts.push(...takeEndpointFailures());
+      logEvent('fallback', '笔记列表 API 不可用，降级到 SSR 页面解析', { severity: 'warn' });
 
-      const viaDom = await listNotesViaDomScroll(userId, maxNotes).catch((err) => {
-        attempts.push(`滚动抛错：${err instanceof Error ? err.message : String(err)}`);
+      const viaSsr = await listNotesViaSsr(userId).catch((err) => {
+        attempts.push(`SSR 抛错：${err instanceof Error ? err.message : String(err)}`);
         return null;
       });
-      if (viaDom && viaDom.length > 0) {
-        listed = viaDom;
-        usedVia.push('dom:scroll');
+      if (viaSsr && viaSsr.length > 0) {
+        listed = viaSsr;
+        usedVia.push('ssr:initial-state');
       } else {
-        attempts.push('页面滚动后仍未渲染出作品卡片');
+        attempts.push('SSR 页面里没找到作品列表（可能被风控替换成错误页）');
+        logEvent('fallback', 'SSR 也没拿到作品列表，降级到滚动页面', { severity: 'warn' });
+
+        const viaDom = await listNotesViaDomScroll(userId, maxNotes).catch((err) => {
+          attempts.push(`滚动抛错：${err instanceof Error ? err.message : String(err)}`);
+          return null;
+        });
+        if (viaDom && viaDom.length > 0) {
+          listed = viaDom;
+          usedVia.push('dom:scroll');
+        } else {
+          attempts.push('页面滚动后仍未渲染出作品卡片');
+        }
       }
     }
   }
@@ -553,7 +592,15 @@ export async function scrapeAuthor(opts: ScrapeOptions): Promise<ScrapeResult> {
 
     onProgress({ phase: 'detail', done: i + 1, total: target.length, noteId: item.noteId });
 
-    const note = await fetchNoteDetail(item.noteId, item.xsecToken).catch(() => null);
+    // 优先用浏览器读页面（和列表同一个思路：页面能过的，我们就能过）
+    let note = await readNotePage(item.noteId, item.xsecToken)
+      .then((dom) => (dom ? toScrapedNote({ noteId: item.noteId, xsecToken: item.xsecToken }, dom) : null))
+      .catch(() => null);
+
+    // 读不到再退回签名 API
+    if (!note) {
+      note = await fetchNoteDetail(item.noteId, item.xsecToken).catch(() => null);
+    }
 
     // 连续多篇拿不到内容，说明不是偶发问题，而是账号/风控层面的整体封锁。
     // 此时继续往下跑毫无意义 —— 每篇要走 3 条降级、每次都要过节流，
