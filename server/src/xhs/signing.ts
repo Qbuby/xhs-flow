@@ -228,16 +228,35 @@ export function signerState(): SignerState {
   return cachedState;
 }
 
+interface ProbeResult {
+  hit: boolean;
+  name?: string;
+  shape?: number;
+  candidates?: string[];
+  present?: string[];
+  attempts?: unknown[];
+}
+
 export async function probeSigner(page: Page): Promise<SignerState> {
   // 页面脚本有时是懒加载的，给它一点时间把签名器塞进 window
   let lastAttempts: unknown[] = [];
   let presentNames: string[] = [];
 
   for (let attempt = 0; attempt < 6; attempt++) {
-    const res = (await page.evaluate(PROBE_SCRIPT)) as
-      | { hit: true; name: string; shape: number }
-      | { hit: false; candidates: string[]; present?: string[]; attempts?: unknown[] }
-      | null;
+    let res: ProbeResult | null = null;
+
+    try {
+      res = (await page.evaluate(PROBE_SCRIPT)) as ProbeResult | null;
+    } catch (err) {
+      // 页面正在导航时会抛 "Execution context was destroyed"，不是致命错误
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/Execution context was destroyed|Target closed|navigating|Frame was detached/i.test(msg)) {
+        cachedState = { ready: false, diagnostic: `探测签名器时出错：${msg.slice(0, 160)}` };
+        return cachedState;
+      }
+      await page.waitForTimeout(1500);
+      continue;
+    }
 
     if (res?.hit) {
       cachedState = {
@@ -269,34 +288,55 @@ export async function probeSigner(page: Page): Promise<SignerState> {
   return cachedState;
 }
 
-/** 为某个请求签名。签名不可用时返回 null，由调用方决定降级策略。 */
+/**
+ * 为某个请求签名。签名不可用时返回 null，由调用方决定降级策略。
+ *
+ * 页面随时可能自我跳转，一次 evaluate 会撞上
+ * "Execution context was destroyed"，这里重试几次 —— 否则定时健康检查
+ * 会随机地报这个错，看起来像是签名失效，其实只是页面在导航。
+ */
 export async function sign(
   page: Page,
   url: string,
   data = '',
+  attempts = 3,
 ): Promise<SignatureHeaders | null> {
-  if (!cachedState.ready) {
-    const ok = await probeSigner(page);
-    if (!ok.ready) return null;
+  let lastErr = '未知原因';
+
+  for (let i = 0; i < attempts; i++) {
+    if (!cachedState.ready) {
+      const ok = await probeSigner(page);
+      if (!ok.ready) return null;
+    }
+
+    try {
+      const res = (await page.evaluate(SIGN_SCRIPT, {
+        url,
+        data,
+        name: cachedState.name as string,
+        shape: cachedState.shape as number,
+      })) as { s: string; t: string; common: string | null } | { error: string } | null;
+
+      if (res && !('error' in res) && res.s && res.t) {
+        const headers: SignatureHeaders = { 'X-s': res.s, 'X-t': res.t };
+        if (res.common) headers['x-s-common'] = res.common;
+        return headers;
+      }
+
+      lastErr = res && 'error' in res ? res.error : '返回为空';
+      // 返回为空通常意味着页面刚刷新、缓存没了，重新探测一次
+      resetSigner();
+    } catch (err) {
+      lastErr = err instanceof Error ? err.message : String(err);
+      const transient =
+        /Execution context was destroyed|Target closed|navigating|Frame was detached/i.test(lastErr);
+      if (!transient) break;
+      await new Promise((r) => setTimeout(r, 1200));
+    }
   }
 
-  const res = (await page.evaluate(SIGN_SCRIPT, {
-    url,
-    data,
-    name: cachedState.name as string,
-    shape: cachedState.shape as number,
-  })) as { s: string; t: string; common: string | null } | { error: string } | null;
-
-  if (!res || 'error' in res || !res.s || !res.t) {
-    logEvent('signature', `签名调用失败：${res && 'error' in res ? res.error : '返回为空'}`, {
-      severity: 'warn',
-    });
-    return null;
-  }
-
-  const headers: SignatureHeaders = { 'X-s': res.s, 'X-t': res.t };
-  if (res.common) headers['x-s-common'] = res.common;
-  return headers;
+  logEvent('signature', `签名调用失败：${lastErr.slice(0, 160)}`, { severity: 'warn' });
+  return null;
 }
 
 /** 重置缓存，用于页面刷新后重新探测。 */

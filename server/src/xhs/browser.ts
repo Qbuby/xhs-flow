@@ -280,10 +280,10 @@ class BrowserSession {
     const page = await ctx.newPage();
 
     await safeGoto(page, `${XHS_ORIGIN}/explore`);
-    // 小红书首屏会自我跳转/懒加载，给它几秒稳定下来再动手
+    // 小红书首屏会自我跳转/懒加载，且登录弹窗是**自动弹出**的
     await sleep(4000);
 
-    // 风控拦截页：只有一句提示，什么都点不了，这时直接给出可操作的错误
+    // 风控拦截页：只有一句提示，什么都点不了
     const bodyText = await readBody(page);
     if (/IP存在风险|安全限制|切换可靠网络环境/.test(bodyText)) {
       await page.close();
@@ -293,46 +293,55 @@ class BrowserSession {
       );
     }
 
-    // 触发登录弹窗。不同版本小红书的按钮文案/类名会变，逐个试。
-    const triggers = [
-      'button:has-text("登录")',
-      '.login-btn',
-      '.side-bar .user-info',
-      '[class*="login"] button',
-    ];
-    let opened = false;
-    for (const sel of triggers) {
-      try {
-        const el = page.locator(sel).first();
-        if ((await el.count()) > 0 && (await el.isVisible().catch(() => false))) {
-          await el.click({ timeout: 2500 });
-          opened = true;
-          break;
-        }
-      } catch {
-        /* 试下一个 */
-      }
-    }
-    if (!opened) logger.warn('未找到登录入口，可能已登录或页面改版');
-
-    // 等二维码出现
+    // ⚠️ 顺序很关键：登录弹窗是自动弹出的，不需要（也不应该）先去点「登录」按钮 ——
+    // 弹窗里就有「登录」按钮，点它会提交空表单把弹窗搞坏。
+    // 所以先找二维码，找不到再考虑点触发器。
     const qrSelectors = [
+      '.login-container .qrcode-img',
       '.qrcode-img',
-      'img[class*="qrcode"]',
-      '[class*="qr-code"] img',
-      'canvas[class*="qrcode"]',
+      '[class*="login"] img[class*="qrcode"]',
+      '.qrcode canvas',
+      '[class*="qr"] img',
     ];
-    let qrEl = null as ReturnType<Page['locator']> | null;
-    for (const sel of qrSelectors) {
-      const loc = page.locator(sel).first();
-      try {
-        if ((await loc.count()) > 0) {
-          await loc.waitFor({ state: 'visible', timeout: 8000 });
-          qrEl = loc;
-          break;
+
+    const findQr = async () => {
+      for (const sel of qrSelectors) {
+        try {
+          const loc = page.locator(sel).first();
+          if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) {
+            return loc;
+          }
+        } catch {
+          /* 试下一个 */
         }
-      } catch {
-        /* 试下一个 */
+      }
+      return null;
+    };
+
+    let qrEl = await findQr();
+
+    // 弹窗可能还在动画/异步加载，轮询一会儿
+    for (let i = 0; i < 8 && !qrEl; i++) {
+      await sleep(1500);
+      qrEl = await findQr();
+    }
+
+    // 还是没有 —— 这次才尝试点开登录入口（例如上次运行把弹窗关掉了）
+    if (!qrEl) {
+      for (const sel of ['button:has-text("登录")', '.login-btn', '.side-bar .login-btn']) {
+        try {
+          const loc = page.locator(sel).first();
+          if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) {
+            await loc.click({ timeout: 2500 });
+            break;
+          }
+        } catch {
+          /* 试下一个 */
+        }
+      }
+      for (let i = 0; i < 6 && !qrEl; i++) {
+        await sleep(1500);
+        qrEl = await findQr();
       }
     }
 
@@ -352,6 +361,7 @@ class BrowserSession {
     }
 
     const qr = await qrEl.screenshot({ type: 'png' });
+    logger.info('已捕获登录二维码，等待扫码');
 
     const promise = (async (): Promise<boolean> => {
       const deadline = Date.now() + timeoutMs;
