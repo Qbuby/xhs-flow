@@ -47,6 +47,7 @@ const LLM_PROFILES = {
 } as const;
 
 export type LlmProfileName = keyof typeof LLM_PROFILES;
+export type LlmApi = 'openai' | 'anthropic';
 
 export interface AppConfig {
   port: number;
@@ -54,6 +55,7 @@ export interface AppConfig {
   openBrowser: boolean;
   llm: {
     profile: LlmProfileName;
+    api: LlmApi;
     baseURL: string;
     apiKey: string;
     model: string;
@@ -87,6 +89,9 @@ export const config: AppConfig = {
 
   llm: {
     profile: requested,
+    api: (str(process.env.XHSFLOW_LLM_API, 'openai').toLowerCase() === 'anthropic'
+      ? 'anthropic'
+      : 'openai') as LlmApi,
     baseURL: str(process.env.XHSFLOW_LLM_BASE_URL, preset.baseURL),
     apiKey: str(process.env.XHSFLOW_LLM_API_KEY),
     model: str(process.env.XHSFLOW_LLM_MODEL, preset.model),

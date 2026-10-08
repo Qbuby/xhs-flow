@@ -118,13 +118,27 @@ export interface JobRow {
   finished_at: string | null;
 }
 
-/** 把本地绝对路径转成前端可访问的 /media URL */
+/**
+ * 把库里存的绝对路径转成前端可访问的 URL。
+ *
+ * 注意：服务端把媒体挂在 "/media/" 下，不是 "/data/media/"，
+ * 所以这里必须把 "/data/media/" 这段前缀去掉，
+ * 否则拼出来的是 /data/media/xxx，直接 404（图会塌成一条线）。
+ *
+ * ⚠️ 注释里千万别写 markdown 加粗路径（如把斜杠路径用星号包起来），
+ * 星号紧挨斜杠会提前闭合块注释，剩余内容被当成代码执行，
+ * 报 "xxx is not defined"。这种 bug 编译期完全看不出来。
+ */
 export function mediaUrl(localPath: string | null | undefined): string | null {
   if (!localPath) return null;
   const norm = localPath.replace(/\\/g, '/');
-  const idx = norm.indexOf('/data/media/');
-  if (idx === -1) return null;
-  return norm.slice(idx);
+  const marker = '/data/media/';
+  const idx = norm.indexOf(marker);
+  if (idx === -1) {
+    // 已经就是 /media/ 开头的话直接用
+    return norm.startsWith('/media/') ? norm : null;
+  }
+  return '/media/' + norm.slice(idx + marker.length);
 }
 
 export function fmtDate(ms: number | null | undefined): string {

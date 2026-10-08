@@ -19,6 +19,9 @@
     "start": "npm run build && node scripts/start.js",
     "serve": "node scripts/start.js",
     "stop": "node scripts/stop.js",
+    "seed:demo": "npm run build:server && node server/dist/diagnostics/seed-demo.js seed",
+    "seed:reset": "node server/dist/diagnostics/seed-demo.js reset",
+    "build:server": "npm -w server run build",
     "postinstall": "playwright install chromium",
     "typecheck": "npm -w server run typecheck && npm -w web run typecheck"
   },
