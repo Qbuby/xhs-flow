@@ -205,6 +205,23 @@ export function Dashboard() {
               </span>
             </div>
           </div>
+        ) : status?.hasSession ? (
+          <div className="mt-5 pt-5 border-t border-ink-100 flex items-center gap-3">
+            <span className="text-sm text-emerald-700">
+              ✓ 已登录，可以直接到「语料库」抓取作者了
+            </span>
+            <button
+              className="btn-ghost"
+              disabled={qrBusy}
+              onClick={() => void startLogin()}
+              title="重新登录（换账号时用）"
+            >
+              {qrBusy ? '处理中…' : '换账号登录'}
+            </button>
+            <Link to="/sources" className="btn-primary">
+              去抓取
+            </Link>
+          </div>
         ) : (
           <div className="mt-5 pt-5 border-t border-ink-100 space-y-3">
             <div className="flex items-center gap-3">
