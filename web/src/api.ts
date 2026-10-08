@@ -1,17 +1,33 @@
 const BASE = '';
 
+/**
+ * 注意：只有**真的带 body** 时才设 Content-Type。
+ * Fastify 收到 application/json + 空 body 会直接抛
+ * FST_ERR_CTP_EMPTY_JSON_BODY，请求根本进不到路由 ——
+ * 表现就是「点了没反应」，而且报错完全指不到真实原因。
+ */
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  const hasBody = init?.body !== undefined && init.body !== null;
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
     ...init,
+    headers: {
+      ...(hasBody ? { 'Content-Type': 'application/json' } : {}),
+      ...(init?.headers as Record<string, string> | undefined),
+    },
   });
   const ct = res.headers.get('content-type') ?? '';
   if (!ct.includes('application/json')) {
     const text = await res.text();
     throw new Error(text || `HTTP ${res.status}`);
   }
-  const body = (await res.json()) as T & { error?: string };
-  if (!res.ok || body.error) throw new Error(body.error ?? `HTTP ${res.status}`);
+  const body = (await res.json()) as T & { error?: string; hint?: string };
+  if (!res.ok || body.error) {
+    // 把后端附带的 hint 一并带出去，界面上才能给出可操作的下一步，
+    // 而不是只甩一句「HTTP 400」
+    const err = new Error(body.error ?? `HTTP ${res.status}`) as Error & { hint?: string };
+    if (body.hint) err.hint = body.hint;
+    throw err;
+  }
   return body;
 }
 

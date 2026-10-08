@@ -13,7 +13,16 @@ import {
   llmIsConfigured,
 } from '../config.js';
 import { logger } from '../logger.js';
-import { all, get, run, recentEvents, recentRunLogs, setSetting, getSetting } from '../db/index.js';
+import {
+  all,
+  get,
+  run,
+  logEvent,
+  recentEvents,
+  recentRunLogs,
+  setSetting,
+  getSetting,
+} from '../db/index.js';
 import { browser } from '../xhs/browser.js';
 import { scrapeAuthor, listSources } from '../xhs/scrape.js';
 import { signerState, resetSigner } from '../xhs/signing.js';
@@ -222,8 +231,21 @@ export async function buildServer() {
 
   /* ---------------- 语料操作 ---------------- */
 
-  app.post('/api/sources/:id/distill', async (req) => {
+  app.post('/api/sources/:id/distill', async (req, reply) => {
     const id = Number((req.params as { id: string }).id);
+
+    // 预检：模型不通就别入队了。排一个注定失败的任务，用户点下去
+    // 只看到「已入队」然后界面永远不动 —— 比直接报错更让人困惑。
+    const probe = await llmHealth();
+    if (!probe.ok) {
+      logEvent('error', `蒸馏未启动：模型不可用 —— ${probe.detail}`, { severity: 'error' });
+      reply.code(400);
+      return {
+        error: `无法开始蒸馏：${probe.detail}`,
+        hint: '请到「设置」页检查模型配置。密钥必须搭配对应的 baseURL —— 智谱的团队套餐和按量付费不是同一个地址。',
+      };
+    }
+
     return { jobId: enqueue('distill', { sourceId: id }) };
   });
 

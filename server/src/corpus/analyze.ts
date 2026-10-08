@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { all, get, run } from '../db/index.js';
+import { all, get, run, logEvent } from '../db/index.js';
 import { chatJson } from '../llm/client.js';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
@@ -185,7 +185,10 @@ export async function analyzeNote(notePk: number): Promise<NoteStyle> {
 }
 
 /** 蒸馏某来源下所有还没做过的笔记。 */
-export async function analyzeSource(sourceId: number, limit = 60): Promise<{ done: number; failed: number }> {
+export async function analyzeSource(
+  sourceId: number,
+  limit = 60,
+): Promise<{ done: number; failed: number; reasons: string[] }> {
   const pending = all<{ id: number }>(
     `SELECT n.id FROM notes n
      LEFT JOIN note_styles ns ON ns.note_id = n.id
@@ -198,6 +201,7 @@ export async function analyzeSource(sourceId: number, limit = 60): Promise<{ don
 
   let done = 0;
   let failed = 0;
+  const reasons: string[] = [];
 
   for (const row of pending) {
     try {
@@ -205,10 +209,30 @@ export async function analyzeSource(sourceId: number, limit = 60): Promise<{ don
       done++;
     } catch (err) {
       failed++;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (reasons.length < 3) reasons.push(msg.slice(0, 240));
+      // 第一次失败就把原因记进事件流，别等到全部跑完才让人发现
+      if (failed === 1) {
+        logEvent('error', `蒸馏第一篇就失败了：${msg.slice(0, 200)}`, { severity: 'error' });
+      }
       logger.error({ notePk: row.id, err }, '单篇蒸馏失败');
+      // 模型不通就别把剩下的笔记全试一遍了 —— 同一把钥匙开所有锁，
+      // 连挂 3 篇基本可以断定是配置问题而不是单篇内容的问题
+      if (failed >= 3 && done === 0) {
+        reasons.push(`（连续 3 篇失败且零成功，提前中止：${pending.length - 3} 篇未处理）`);
+        break;
+      }
     }
   }
 
+  // 一篇都没成功就必须把原因抛出去 —— 否则任务会被记成 done，
+  // 界面上「已蒸馏 0」却什么都不显示，看起来像点了没反应
+  if (done === 0 && failed > 0) {
+    throw new Error(
+      `${failed} 篇全部蒸馏失败，没有一篇成功。原因：${reasons.join(' | ') || '未知'}`,
+    );
+  }
+
   logger.info({ sourceId, done, failed }, '语料蒸馏完成');
-  return { done, failed };
+  return { done, failed, reasons };
 }

@@ -144,6 +144,23 @@ export async function chatJson<T>(opts: ChatOptions): Promise<T> {
   }
 }
 
+/** 把厂商返回的原始报文翻成人话，别把整段 JSON 甩到界面上。 */
+function friendlyError(raw: string): string {
+  if (/401|无效的令牌|invalid.*(token|key)|Unauthorized/i.test(raw)) {
+    return '模型鉴权失败（HTTP 401：密钥无效或没权限）。请核对 API Key 与 baseURL 是否匹配。';
+  }
+  if (/404|not found|model.*not/i.test(raw)) {
+    return '模型名或端点不存在（HTTP 404）。请检查 baseURL 与 model 拼写。';
+  }
+  if (/429|rate limit|quota/i.test(raw)) {
+    return '触发限流或额度用尽（HTTP 429）。稍后再试。';
+  }
+  if (/timeout|ETIMEDOUT|ENOTFOUND|ECONNREFUSED/i.test(raw)) {
+    return '无法连接模型服务（网络或地址问题）。请检查 baseURL 是否可访问。';
+  }
+  return raw.length > 160 ? `${raw.slice(0, 160)}…` : raw;
+}
+
 /** 探活，设置页用。 */
 export async function llmHealth(): Promise<{ ok: boolean; detail: string }> {
   if (!config.llm.apiKey) return { ok: false, detail: '未配置 key' };
@@ -151,7 +168,8 @@ export async function llmHealth(): Promise<{ ok: boolean; detail: string }> {
     const out = await chat({ user: '回复两个字：正常', maxTokens: 32, temperature: 0 });
     return { ok: true, detail: `${config.llm.model} 响应：${out.trim().slice(0, 40)}` };
   } catch (err) {
-    return { ok: false, detail: err instanceof Error ? err.message : String(err) };
+    const raw = err instanceof Error ? err.message : String(err);
+    return { ok: false, detail: friendlyError(raw) };
   }
 }
 

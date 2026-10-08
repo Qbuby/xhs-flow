@@ -60,6 +60,8 @@ export function SourceDetail() {
   const [composeOpen, setComposeOpen] = useState(false);
   const [composeTopic, setComposeTopic] = useState('');
   const [composeAngle, setComposeAngle] = useState('');
+  const [running, setRunning] = useState<string | null>(null);
+  const [hint, setHint] = useState<string | null>(null);
 
   async function load() {
     if (!id) return;
@@ -88,13 +90,39 @@ export function SourceDetail() {
     try {
       await fn();
       toast(msg);
-      setTimeout(() => void load(), 1500);
+      // 后台任务要跑一会儿，给个可见的进行中状态，
+      // 否则「点了没反应」和「正在跑」在界面上长得一模一样
+      setRunning(name);
+      setTimeout(() => void load(), 2000);
     } catch (err) {
-      toast(err instanceof Error ? err.message : String(err), 'err');
+      const e = err as { message?: string; hint?: string };
+      toast(e.message ?? String(err), 'err');
+      if (e.hint) setHint(e.hint);
     } finally {
       setBusy('');
     }
   }
+
+  /** 轮询任务状态，完成或失败后停止 */
+  useEffect(() => {
+    if (!running) return;
+    const t = setInterval(async () => {
+      try {
+        const j = await api.get<{ type: string; status: string; last_error: string | null }>(
+          `/api/jobs?source=${id}`,
+        );
+        const hit = j.find((x) => x.type === running && x.status === 'running');
+        if (!hit) {
+          setRunning(null);
+          setHint(null);
+          void load();
+        }
+      } catch {
+        /* 忽略 */
+      }
+    }, 4000);
+    return () => clearInterval(t);
+  }, [running, id]);
 
   async function openNote(pk: number) {
     try {
@@ -149,15 +177,15 @@ export function SourceDetail() {
           <div className="flex gap-2">
             <button
               className="btn-ghost"
-              disabled={busy === 'distill'}
-              onClick={() => void act('distill', () => api.post(`/api/sources/${id}/distill`), '蒸馏任务已入队')}
+              disabled={busy === 'distill' || running === 'distill'}
+              onClick={() => void act('distill', () => api.post(`/api/sources/${id}/distill`), '蒸馏已开始')}
             >
               {busy === 'distill' ? '提交中…' : '蒸馏语料'}
             </button>
             <button
               className="btn-ghost"
-              disabled={busy === 'ideate'}
-              onClick={() => void act('ideate', () => api.post(`/api/sources/${id}/ideate`), '选题任务已入队')}
+              disabled={busy === 'ideate' || running === 'ideate'}
+              onClick={() => void act('ideate', () => api.post(`/api/sources/${id}/ideate`), '选题已开始')}
             >
               {busy === 'ideate' ? '提交中…' : 'AI 选题'}
             </button>
@@ -197,6 +225,32 @@ export function SourceDetail() {
             </button>
           </div>
         </Card>
+      )}
+
+      {running && (
+        <div className="rounded-lg bg-violet-50 border border-violet-200 px-4 py-3 mb-4 text-sm text-violet-800 flex items-center gap-2">
+          <span className="w-3.5 h-3.5 border-2 border-violet-300 border-t-violet-600 rounded-full animate-spin" />
+          {running === 'distill'
+            ? '正在蒸馏语料…每篇都要调一次模型，篇数多的话需要几分钟'
+            : running === 'ideate'
+              ? '正在生成选题…'
+              : '处理中…'}
+          <button
+            className="ml-auto text-xs text-violet-600 hover:underline"
+            onClick={() => {
+              setRunning(null);
+              void load();
+            }}
+          >
+            不看了
+          </button>
+        </div>
+      )}
+
+      {hint && (
+        <div className="rounded-lg bg-amber-50 border border-amber-200 px-4 py-3 mb-4 text-sm text-amber-800">
+          {hint}
+        </div>
       )}
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-5">

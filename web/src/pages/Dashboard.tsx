@@ -3,7 +3,6 @@ import { Link } from 'react-router-dom';
 import { api, type Health, type Draft, type Source, type EventRow } from '../api';
 import { Card, SectionTitle, StatusBadge, Stat, Dot, Spinner, Empty } from '../components';
 import { toast } from '../store';
-import { useUi } from '../store';
 
 export function Dashboard() {
   const [health, setHealth] = useState<Health | null>(null);
@@ -21,7 +20,6 @@ export function Dashboard() {
     browserRunning: boolean;
     ipBlocked?: { blocked: boolean; message: string };
   } | null>(null);
-  const toasts = useUi((s) => s.toasts);
 
   async function load() {
     try {
@@ -137,19 +135,6 @@ export function Dashboard() {
 
   return (
     <div>
-      <div className="fixed top-5 right-8 z-50 space-y-2">
-        {toasts.map((t) => (
-          <div
-            key={t.id}
-            className={`px-4 py-2.5 rounded-lg text-sm shadow-lg text-white ${
-              t.kind === 'ok' ? 'bg-ink-900' : 'bg-rose-600'
-            }`}
-          >
-            {t.text}
-          </div>
-        ))}
-      </div>
-
       <SectionTitle
         title="总览"
         desc="登录状态、任务队列与内容产出"
