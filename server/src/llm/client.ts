@@ -44,13 +44,18 @@ export interface ChatOptions {
 /* Anthropic Messages                                                  */
 /* ------------------------------------------------------------------ */
 
-async function chatAnthropic(opts: ChatOptions): Promise<string> {
+interface AnthropicResponse {
+  content?: Array<{ type: string; text?: string; thinking?: string }>;
+  stop_reason?: string;
+}
+
+async function callAnthropic(opts: ChatOptions, maxTokens: number): Promise<AnthropicResponse> {
   const base = config.llm.baseURL.replace(/\/+$/, '');
   const url = base.endsWith('/v1/messages') ? base : `${base}/v1/messages`;
 
   const body = {
     model: config.llm.model,
-    max_tokens: opts.maxTokens ?? 4096,
+    max_tokens: maxTokens,
     // Anthropic 的 system 是顶层字段，不放进 messages
     ...(opts.system ? { system: opts.system } : {}),
     messages: [{ role: 'user', content: opts.user }],
@@ -69,25 +74,46 @@ async function chatAnthropic(opts: ChatOptions): Promise<string> {
   });
 
   const text = await res.text();
+  if (!res.ok) throw new Error(`Anthropic 端点 HTTP ${res.status}: ${text.slice(0, 300)}`);
 
-  if (!res.ok) {
-    throw new Error(`Anthropic 端点 HTTP ${res.status}: ${text.slice(0, 300)}`);
-  }
-
-  let json: { content?: Array<{ type: string; text?: string }> };
   try {
-    json = JSON.parse(text) as typeof json;
+    return JSON.parse(text) as AnthropicResponse;
   } catch {
     throw new Error(`Anthropic 响应不是 JSON：${text.slice(0, 200)}`);
   }
+}
 
-  // content 是内容块数组，可能混入 thinking 之类的非文本块
-  const out = (json.content ?? [])
+function joinText(json: AnthropicResponse): string {
+  return (json.content ?? [])
     .filter((b) => b.type === 'text' && typeof b.text === 'string')
     .map((b) => b.text as string)
-    .join('');
+    .join('')
+    .trim();
+}
 
-  if (!out.trim()) throw new Error('Anthropic 返回了空内容');
+async function chatAnthropic(opts: ChatOptions): Promise<string> {
+  let budget = opts.maxTokens ?? 8192;
+  let json = await callAnthropic(opts, budget);
+
+  let out = joinText(json);
+
+  // MiniMax-M3 / Claude 这类**推理模型**会先吐 thinking 块，
+  // 如果 max_tokens 给小了，额度全被思考吃掉，一个 text 块都不剩
+  // （表现为 stop_reason=max_tokens 且返回空内容）。这时加倍预算重来一次。
+  if (!out && json.stop_reason === 'max_tokens') {
+    logger.warn({ budget }, '模型思考耗尽了 token 预算，加大额度重试');
+    budget = Math.min(budget * 4, 32_000);
+    json = await callAnthropic(opts, budget);
+    out = joinText(json);
+  }
+
+  if (!out) {
+    const kinds = (json.content ?? []).map((b) => b.type).join(',') || '(空)';
+    throw new Error(
+      `模型没有返回正文（内容块类型：${kinds}，stop_reason=${json.stop_reason ?? '?'}）。` +
+        `若 stop_reason=max_tokens，说明 max_tokens 全被 thinking 消耗了，需要调大。`,
+    );
+  }
   return out;
 }
 
@@ -165,7 +191,7 @@ function friendlyError(raw: string): string {
 export async function llmHealth(): Promise<{ ok: boolean; detail: string }> {
   if (!config.llm.apiKey) return { ok: false, detail: '未配置 key' };
   try {
-    const out = await chat({ user: '回复两个字：正常', maxTokens: 32, temperature: 0 });
+    const out = await chat({ user: '回复两个字：正常', maxTokens: 2048, temperature: 0 });
     return { ok: true, detail: `${config.llm.model} 响应：${out.trim().slice(0, 40)}` };
   } catch (err) {
     const raw = err instanceof Error ? err.message : String(err);

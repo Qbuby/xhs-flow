@@ -100,6 +100,28 @@ function buildExamplesBlock(examples: RetrievedNote[]): string {
 /* 主流程                                                              */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 创作阶段的 JSON 模板。
+ *
+ * 之前只用散文描述「cover 要有 eyebrow/title/items」，模型就照字面理解，
+ * 把字段平铺到卡片对象上（{"layout":"cover","title":"…"}）而不是塞进 blocks，
+ * 渲染出来全是空卡。给模板比讲道理有效 —— 蒸馏那边已经验证过同样一招。
+ */
+const DRAFT_TEMPLATE = `{
+  "title": "20 字以内的标题",
+  "body": "完整正文，1000 字以内，可含 #话题",
+  "tags": ["话题1", "话题2"],
+  "cards": [
+    { "layout": "cover", "blocks": { "eyebrow": "短标签", "title": "主标题，用 [[强调]]", "items": ["短句1", "短句2"], "hint": "引导语" } },
+    { "layout": "quote", "blocks": { "text": "金句", "note": "补充解释", "attribution": "出处" } },
+    { "layout": "list", "blocks": { "eyebrow": "重点", "title": "标题", "items": [{ "text": "要点", "note": "补充" }] } },
+    { "layout": "steps", "blocks": { "eyebrow": "怎么做", "title": "标题", "items": [{ "text": "步骤", "note": "说明" }] } },
+    { "layout": "compare", "blocks": { "eyebrow": "对比", "title": "标题", "left": { "title": "A", "items": ["…"] }, "right": { "title": "B", "items": ["…"] }, "conclusion": "结论" } },
+    { "layout": "photo_text", "blocks": { "title": "标题", "subtitle": "副标题", "photoQuery": "配图检索词" } },
+    { "layout": "cta", "blocks": { "emoji": "👋", "title": "标题", "action": "引导语" } }
+  ]
+}`;
+
 export interface ComposeResult {
   draftId: number;
   title: string;
@@ -139,12 +161,19 @@ export async function composeDraft(opts: {
     '- photo_text：title + subtitle + photoQuery(配图检索词，如 "咖啡 桌面")',
     '- cta：title + action(引导语) + emoji',
     '',
+    '【最重要的要求】严格按下面这份 JSON 结构输出。',
+    '每张卡片的文案字段必须**嵌套在 blocks 对象内**，不要平铺到卡片对象上。',
+    '```json',
+    DRAFT_TEMPLATE,
+    '```',
+    '',
     '现在输出 JSON。',
   ]
     .filter(Boolean)
     .join('\n');
 
-  const raw = await chatJson<Draft>({ system: SYSTEM, user, temperature: 0.85, maxTokens: 4096 });
+  const raw = await chatJson<Draft>({ system: SYSTEM, user, temperature: 0.85, maxTokens: 16_384 });
+
 
   const draft = coerceDraft(raw);
 
@@ -191,8 +220,23 @@ function coerceDraft(raw: Draft): Draft {
 
   cards = cards.map((c, i) => {
     const layout = LAYOUTS.includes(c?.layout as Layout) ? (c.layout as Layout) : i === 0 ? 'cover' : 'list';
-    const blocks =
-      c?.blocks && typeof c.blocks === 'object' && !Array.isArray(c.blocks) ? (c.blocks as Record<string, unknown>) : {};
+    let blocks: Record<string, unknown> =
+      c?.blocks && typeof c.blocks === 'object' && !Array.isArray(c.blocks)
+        ? (c.blocks as Record<string, unknown>)
+        : {};
+
+    // 兜底：模型经常把 blocks 的字段平铺到卡片对象上
+    // （{"layout":"cover","title":"…"}），这时渲染出来是一张全空的卡。
+    // 这里把散落的字段收拢回 blocks。
+    if (Object.keys(blocks).length === 0 && c && typeof c === 'object') {
+      const flat: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(c as Record<string, unknown>)) {
+        if (k === 'layout' || k === 'blocks') continue;
+        flat[k] = v;
+      }
+      if (Object.keys(flat).length > 0) blocks = flat;
+    }
+
     return { layout, blocks, photoQuery: c?.photoQuery };
   });
 
@@ -281,7 +325,7 @@ export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{
       `请产出 ${count} 个新选题。`,
     ].join('\n'),
     temperature: 0.9,
-    maxTokens: 2048,
+    maxTokens: 8_192,
   });
 
   const topics = Array.isArray(raw?.topics) ? raw.topics : [];

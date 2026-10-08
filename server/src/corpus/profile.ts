@@ -4,6 +4,7 @@ import { chatJson } from '../llm/client.js';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
 import { cjkRatio, countEmoji } from '../util/text.js';
+import { asTemplate } from './schema-template.js';
 
 /**
  * 作者级聚合画像。
@@ -179,13 +180,18 @@ export async function buildStyleProfile(sourceId: number): Promise<StyleProfile 
     '- title_formulas / signature_phrases / do_list / dont_list 要从证据里归纳，引用真实措辞',
     '- card_template_spec 必须给出可直接渲染的 #hex 色值与 px 字号',
     '- topic_map 按选题聚类，note_count 要反映样稿里的真实分布',
+    '',
+    '【最重要的要求】严格按下面这份 JSON 结构输出，字段名不要自创或改名：',
+    '```json',
+    JSON.stringify(asTemplate(StyleProfileSchema), null, 2),
+    '```',
   ].join('\n');
 
   const raw = await chatJson<StyleProfile>({
     system: PROFILE_SYSTEM,
     user,
     temperature: 0.35,
-    maxTokens: 4096,
+    maxTokens: 8192,
   });
 
   const parsed = StyleProfileSchema.safeParse(raw);

@@ -4,6 +4,7 @@ import { chatJson } from '../llm/client.js';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
 import { cjkRatio, countEmoji } from '../util/text.js';
+import { asTemplate } from './schema-template.js';
 
 /**
  * 单篇笔记的结构化蒸馏。
@@ -139,9 +140,19 @@ const ANALYZE_SYSTEM = `你是一位小红书内容策略分析师，正在为�
 
 铁律：
 1. 只描述**你在这篇里真实看到的东西**。看不到的字段就说"这篇没有体现"，绝不脑补。
-2. 给出的公式必须是可套用的模板，不是形容词堆砌。例如标题公式写"痛点场景 + 数字清单 + 结果承诺"，不要写"标题很有吸引力"。
+2. 给出的公式必须是可套用的模板，不是形容词堆砌。
 3. 语气、话术要具体到可以直接复用的措辞。
-4. 客观指标（字数、emoji 数、主色板、亮度）由程序统计，以它为准。`;
+4. 客观指标（字数、emoji 数、主色板、亮度）由程序统计，以它为准。
+
+【最重要的要求】
+严格按照下面这份 JSON 结构输出，**字段名必须完全一致**，不要自创、不要改名、不要增删顶层字段。
+每个字段的值用你自己的话写；拿不准的写"这篇未体现"。
+
+\`\`\`json
+${JSON.stringify(asTemplate(NoteStyleSchema), null, 2)}
+\`\`\`
+
+只输出 JSON 对象本身，不要解释文字，不要代码块围栏。`;
 
 export async function analyzeNote(notePk: number): Promise<NoteStyle> {
   const note = get<NoteRow>('SELECT * FROM notes WHERE id = ?', notePk);
@@ -164,7 +175,7 @@ export async function analyzeNote(notePk: number): Promise<NoteStyle> {
     system: ANALYZE_SYSTEM,
     user,
     temperature: 0.3,
-    maxTokens: 2048,
+    maxTokens: 8_192,
   });
 
   const parsed = NoteStyleSchema.safeParse(style);
