@@ -1,0 +1,23 @@
+node_modules/
+dist/
+build/
+
+# 本地运行时数据：sqlite、图片缓存、Playwright 持久化 profile（含小红书登录态，务必勿提交）
+data/
+
+.env
+.env.local
+.env.*.local
+
+*.log
+npm-debug.log*
+
+.DS_Store
+Thumbs.db
+
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# 编辑器/工具的本地会话产物
+.zcode/

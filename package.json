@@ -1,0 +1,31 @@
+{
+  "name": "xhsflow",
+  "version": "0.1.0",
+  "private": true,
+  "description": "小红书品牌/营销/IP 图文智能体 —— 常驻本地服务：抓取作者全量图文 → 蒸馏语料库 → 定时产稿 → 审核 → 发布",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c cyan,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "npm -w server run dev",
+    "dev:web": "npm -w web run dev",
+    "build": "npm -w web run build && npm -w server run build",
+    "start": "npm run build && npm -w server run start",
+    "serve": "npm -w server run start",
+    "postinstall": "playwright install chromium",
+    "typecheck": "npm -w server run typecheck && npm -w web run typecheck"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "playwright": "^1.64.0"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}
