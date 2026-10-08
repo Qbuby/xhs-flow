@@ -3,7 +3,7 @@ import type { BrowserContext, Page } from 'playwright';
 import path from 'node:path';
 import { PROFILE_DIR, config } from '../config.js';
 import { logger } from '../logger.js';
-import { logEvent } from '../db/index.js';
+import { logEvent, setSetting } from '../db/index.js';
 import { sleep } from '../util/throttle.js';
 import { sign } from './signing.js';
 
@@ -259,7 +259,20 @@ class BrowserSession {
     return out;
   }
 
-  snapshot(): Promise<CookieSnapshot> {
+  snapshot(opts: { onlyIfRunning?: boolean } = {}): Promise<CookieSnapshot & { skipped?: boolean }> {
+    // 同 healthCheck：只在需要时启动浏览器。
+    // /api/health 会被前端每 8 秒轮询一次，如果这里顺带启动浏览器，
+    // 用户打开控制台几秒后桌面就会莫名其妙弹窗。
+    if (opts.onlyIfRunning && !this.ctx) {
+      return Promise.resolve({
+        cookies: {},
+        missing: [...REQUIRED_COOKIES],
+        hasSession: false,
+        webSession: null,
+        skipped: true,
+      });
+    }
+
     return this.cookies().then((cookies) => {
       const missing = REQUIRED_COOKIES.filter((k) => !cookies[k]);
       return {
@@ -282,6 +295,14 @@ class BrowserSession {
     await safeGoto(page, `${XHS_ORIGIN}/explore`);
     // 小红书首屏会自我跳转/懒加载，且登录弹窗是**自动弹出**的
     await sleep(4000);
+
+    // 浏览器起来之后先看有没有登录态 —— 已登录时小红书根本不会弹登录框，
+    // 再往下找二维码只会得到一句误导性的「页面可能已改版」。
+    const snap = await this.snapshot();
+    if (snap.hasSession) {
+      await page.close().catch(() => undefined);
+      throw new Error('当前已经是登录状态，无需扫码');
+    }
 
     // 风控拦截页：只有一句提示，什么都点不了
     const bodyText = await readBody(page);
@@ -478,12 +499,27 @@ class BrowserSession {
    *   code === -101     → 签名通过，但没登录（需要扫码）
    *   404 / 非 JSON     → 签名或传输层出问题了
    */
-  async healthCheck(): Promise<{
+  async healthCheck(opts: { onlyIfRunning?: boolean } = {}): Promise<{
     ok: boolean;
     signed: boolean;
     loggedIn: boolean;
     detail: string;
+    skipped?: boolean;
   }> {
+    // 关键：定时健康检查**绝不能**顺手把浏览器拉起来。
+    // 它是每 17 分钟跑一次的后台任务，一旦顺带启动，
+    // 用户桌面就会不停弹出小红书窗口。用到浏览器的动作（登录/抓取/发布）
+    // 会自己启动，这里只在已经开着的时候探一下。
+    if (opts.onlyIfRunning && !this.ctx) {
+      return {
+        ok: true,
+        signed: false,
+        loggedIn: false,
+        skipped: true,
+        detail: '浏览器未启动，跳过检查',
+      };
+    }
+
     const path = '/api/sns/web/v2/user/me';
     try {
       const page = await this.transportPage_();
@@ -523,6 +559,16 @@ class BrowserSession {
         return { ok: false, signed: true, loggedIn: false, detail: '签名正常，但尚未登录，请扫码' };
       }
       if (envelope.success === true || envelope.code === 0) {
+        // 记一笔「上次已知状态」：进程重启后浏览器没启动，
+        // 操作台还能显示正确的登录态，而不必为此拉起浏览器。
+        try {
+          setSetting(
+            'session_hint',
+            JSON.stringify({ hasSession: true, at: new Date().toISOString() }),
+          );
+        } catch {
+          /* 可忽略 */
+        }
         return { ok: true, signed: true, loggedIn: true, detail: '会话有效' };
       }
       return {

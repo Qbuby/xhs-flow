@@ -156,7 +156,10 @@ const handlers: Record<JobType, Handler> = {
   },
 
   async healthcheck() {
-    const cookie = await browser.healthCheck();
+    // 只在浏览器已经开着的时候探一下，不要把这个后台任务变成
+    // 「每 17 分钟弹一次小红书窗口」的东西。
+    const cookie = await browser.healthCheck({ onlyIfRunning: true });
+    if (cookie.skipped) return cookie;
     logEvent('cookie', cookie.ok ? '会话正常' : `会话异常：${cookie.detail}`, {
       severity: cookie.ok ? 'info' : 'warn',
     });

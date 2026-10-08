@@ -73,12 +73,37 @@ export function Dashboard() {
     setQrBusy(true);
     try {
       const res = await fetch('/api/login/qr', { method: 'POST' });
-      if (!res.ok) {
-        const body = (await res.json().catch(() => ({}))) as { error?: string };
+      const ctype = res.headers.get('content-type') ?? '';
+      if (!res.ok || !ctype.includes('image/png')) {
+        const body = (await res.json().catch(() => ({}))) as {
+          error?: string;
+          alreadyLoggedIn?: boolean;
+          detail?: string;
+        };
+        // 已登录时后端不会去找二维码，这是正常情况不是故障
+        if (body.alreadyLoggedIn) {
+          toast(body.detail ?? '已经是登录状态');
+          void load();
+          return;
+        }
         throw new Error(body.error ?? `HTTP ${res.status}`);
       }
       const blob = await res.blob();
       setQr(URL.createObjectURL(blob));
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), 'err');
+    } finally {
+      setQrBusy(false);
+    }
+  }
+
+  async function resetLogin() {
+    if (!confirm('清除本地登录态？下次登录需要重新扫码。')) return;
+    setQrBusy(true);
+    try {
+      await api.post('/api/login/reset');
+      toast('已清除登录态');
+      void load();
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'err');
     } finally {
@@ -210,17 +235,21 @@ export function Dashboard() {
             <span className="text-sm text-emerald-700">
               ✓ 已登录，可以直接到「语料库」抓取作者了
             </span>
-            <button
-              className="btn-ghost"
-              disabled={qrBusy}
-              onClick={() => void startLogin()}
-              title="重新登录（换账号时用）"
-            >
-              {qrBusy ? '处理中…' : '换账号登录'}
+            <button className="btn-ghost" onClick={() => void resetLogin()} title="清空本地登录态">
+              退出登录
             </button>
             <Link to="/sources" className="btn-primary">
               去抓取
             </Link>
+          </div>
+        ) : health?.browser.unknown ? (
+          <div className="mt-5 pt-5 border-t border-ink-100 flex items-center gap-3">
+            <span className="text-sm text-ink-500">
+              登录状态尚未验证（浏览器按需启动，点下面按钮才会打开）
+            </span>
+            <button className="btn-primary" disabled={qrBusy} onClick={() => void startLogin()}>
+              {qrBusy ? '启动中…' : '验证并登录'}
+            </button>
           </div>
         ) : (
           <div className="mt-5 pt-5 border-t border-ink-100 space-y-3">

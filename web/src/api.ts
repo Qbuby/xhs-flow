@@ -29,7 +29,7 @@ export interface Health {
   llmConfigured: boolean;
   llmMissing: string[];
   stockProviders: string[];
-  browser: { running: boolean; hasSession: boolean; missingCookies: string[] };
+  browser: { running: boolean; hasSession: boolean; unknown?: boolean; missingCookies: string[]; lastCheckedAt?: string | null };
   signer: { ready: boolean; diagnostic: string };
   scheduler: {
     running: boolean;

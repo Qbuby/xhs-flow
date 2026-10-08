@@ -4,12 +4,19 @@ import fstatic from '@fastify/static';
 import path from 'node:path';
 import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
-import { config, WEB_DIST, describeMissingConfig, MEDIA_DIR, llmIsConfigured } from '../config.js';
+import {
+  config,
+  WEB_DIST,
+  describeMissingConfig,
+  MEDIA_DIR,
+  PROFILE_DIR,
+  llmIsConfigured,
+} from '../config.js';
 import { logger } from '../logger.js';
 import { all, get, run, recentEvents, recentRunLogs, setSetting, getSetting } from '../db/index.js';
 import { browser } from '../xhs/browser.js';
 import { scrapeAuthor, listSources } from '../xhs/scrape.js';
-import { signerState } from '../xhs/signing.js';
+import { signerState, resetSigner } from '../xhs/signing.js';
 import { getStyleProfile } from '../corpus/profile.js';
 import { composeDraft, ideateTopics, renderDraftCards } from '../generate/pipeline.js';
 import { DEFAULT_SPEC, renderCard } from '../generate/cards.js';
@@ -26,7 +33,13 @@ export async function buildServer() {
   /* ---------------- 系统状态 ---------------- */
 
   app.get('/api/health', async () => {
-    const cookies = await browser.snapshot().catch(() => null);
+    // 绝不因为一次健康查询就把浏览器拉起来 —— 前端每 8 秒轮询一次这里。
+    // 浏览器没开时回落到「上次已知状态」，这样界面既不会被弹窗打扰，
+    // 也不会因为进程重启就把已登录状态误报成未登录。
+    const snap = await browser.snapshot({ onlyIfRunning: true }).catch(() => null);
+    const cached = getSetting('session_hint');
+    const lastKnown = cached ? (JSON.parse(cached) as { hasSession: boolean; at: string }) : null;
+
     return {
       ok: true,
       llm: llmInfo(),
@@ -35,8 +48,11 @@ export async function buildServer() {
       stockProviders: activeProviders().map((p) => p.name),
       browser: {
         running: browser.isRunning(),
-        hasSession: cookies?.hasSession ?? false,
-        missingCookies: cookies?.missing ?? [],
+        hasSession: snap?.hasSession ?? lastKnown?.hasSession ?? false,
+        // 未启动且没有缓存 → 说明这台机器还没验证过登录
+        unknown: Boolean(snap?.skipped && !lastKnown),
+        missingCookies: snap?.skipped ? [] : (snap?.missing ?? []),
+        lastCheckedAt: lastKnown?.at ?? null,
       },
       signer: signerState(),
       scheduler: schedulerInfo(),
@@ -70,12 +86,13 @@ export async function buildServer() {
   /* ---------------- 登录 ---------------- */
 
   app.get('/api/login/status', async () => {
-    const snap = await browser.snapshot().catch(() => null);
+    const snap = await browser.snapshot({ onlyIfRunning: true }).catch(() => null);
     return {
       ...snap,
       signer: signerState(),
       browserRunning: browser.isRunning(),
-      ipBlocked: await browser.checkIpBlocked(),
+      // 只有用户主动点登录/抓取时才会真正启动浏览器
+      ipBlocked: snap?.skipped ? null : await browser.checkIpBlocked(),
     };
   });
 
@@ -91,6 +108,13 @@ export async function buildServer() {
   });
 
   app.post('/api/login/qr', async (_req, reply) => {
+    // 已经有登录态就别去找二维码了 —— 已登录时小红书根本不弹登录框，
+    // 硬找只会得到一句莫名其妙的「页面可能已改版」。
+    const snap = await browser.snapshot({ onlyIfRunning: true }).catch(() => null);
+    if (snap?.hasSession) {
+      return { alreadyLoggedIn: true, detail: '当前已经是登录状态，无需再扫码' };
+    }
+
     try {
       const { qr, promise } = await browser.startQrLogin();
       // 立刻返回二维码；登录在后台继续等
@@ -103,6 +127,19 @@ export async function buildServer() {
       reply.code(500);
       return { error: err instanceof Error ? err.message : String(err) };
     }
+  });
+
+  /** 清除登录态（换账号用）—— 连同整个浏览器 profile 一起清，cookie 无从残留。 */
+  app.post('/api/login/reset', async () => {
+    await browser.close().catch(() => undefined);
+    try {
+      await fsPromises.rm(PROFILE_DIR, { recursive: true, force: true });
+      await fsPromises.mkdir(PROFILE_DIR, { recursive: true });
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+    resetSigner();
+    return { ok: true, detail: '已清除本地登录态，下次登录会重新走扫码' };
   });
 
   app.post('/api/browser/launch', async () => {

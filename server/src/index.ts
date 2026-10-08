@@ -35,15 +35,9 @@ async function main(): Promise<void> {
 
   startScheduler();
 
-  // 启动时探一下会话，让操作台一打开就知道能不能干活
-  void (async () => {
-    try {
-      const health = await browser.healthCheck();
-      logger.info(health.ok ? '小红书会话正常' : `小红书会话未就绪：${health.detail}`);
-    } catch {
-      logger.info('未启动浏览器（首次使用请在操作台扫码登录）');
-    }
-  })();
+  // 启动时**不**主动拉浏览器：桌面弹窗是很打扰的，而且登录态本来就在
+  // profile 里，用户点到「扫码登录」或「抓取」时自然会启动。
+  logger.info('浏览器按需启动 —— 点「扫码登录」或发起抓取时才打开');
 
   if (config.openBrowser && isMain) openBrowser(url);
 
