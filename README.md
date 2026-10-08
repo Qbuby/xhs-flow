@@ -30,6 +30,21 @@ npm start            # 构建 + 启动 + 自动打开浏览器
 
 开发模式（前端热更新）：`npm run dev`
 
+### 常用命令
+
+```bash
+npm start     # 构建并启动（跳过重复构建用 npm run serve）
+npm run stop  # 停止后台运行的服务，并清理它拉起的浏览器
+npm run typecheck
+```
+
+> **端口被占用 / 日志乱码？**
+> - `EADDRINUSE 8787` 说明上次没退干净，跑一次 `npm run stop` 即可。
+>   它只匹配本项目的进程，不会误杀你机器上别的 node 服务。
+> - 中文日志乱码（`鍚€鍔婁槸`）是 Windows 控制台默认用 GBK 代码页渲染 UTF-8 导致的。
+>   `npm start` 会自动切到 UTF-8；如果你在 **Windows PowerShell 5.1** 里仍看到乱码，
+>   先执行一次 `chcp 65001`，或改用 PowerShell 7。
+
 ---
 
 ## 配置
