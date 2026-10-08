@@ -1,5 +1,13 @@
 import { browser, XHS_ORIGIN } from './browser.js';
-import { ENDPOINTS, noteUrl, parseProfileUrl, signedFetch, tryEndpoints, fetchHtml } from './api.js';
+import {
+  ENDPOINTS,
+  noteUrl,
+  parseProfileUrl,
+  signedFetch,
+  tryEndpoints,
+  fetchHtml,
+  takeEndpointFailures,
+} from './api.js';
 import { logger } from '../logger.js';
 import { logEvent, run, all, get, transaction } from '../db/index.js';
 import { parseInitialState, extractTags } from '../util/text.js';
@@ -111,6 +119,14 @@ function normalizeNote(raw: Record<string, unknown>): ScrapedNote | null {
 /* 详情：三级降级                                                       */
 /* ------------------------------------------------------------------ */
 
+/** 详情失败的累积原因，供上层给出可操作的诊断。 */
+const detailFailures: string[] = [];
+function takeDetailFailures(): string[] {
+  const out = [...new Set(detailFailures)];
+  detailFailures.length = 0;
+  return out;
+}
+
 async function fetchNoteDetail(noteId: string, xsecToken: string | null): Promise<ScrapedNote | null> {
   // 1) /feed（POST，带 xsec_source）
   const feed = await signedFetch<Record<string, any>>(ENDPOINTS.feed, {
@@ -121,16 +137,28 @@ async function fetchNoteDetail(noteId: string, xsecToken: string | null): Promis
       extra: { need_body_topic: 1 },
       xsec_token: xsecToken ?? '',
     },
-  }).catch(() => null);
-  const feedNote = feed?.data ? normalizeNote(feed.data) : null;
-  if (feedNote) return { ...feedNote, xsecToken: feedNote.xsecToken ?? xsecToken };
+  }).catch((err) => {
+    detailFailures.push(`feed 调用异常：${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  });
+  if (feed?.ok && feed.data) {
+    const n = normalizeNote(feed.data);
+    if (n) return { ...n, xsecToken: n.xsecToken ?? xsecToken };
+  }
+  if (feed && !feed.ok) detailFailures.push(`feed ${feed.error}`);
 
   // 2) /note/<id>
   const detail = await signedFetch<Record<string, any>>(`${ENDPOINTS.noteDetail}/${noteId}`, {
     params: { xsec_token: xsecToken ?? '', xsec_source: 'pc_search' },
-  }).catch(() => null);
-  const detailNote = detail?.data ? normalizeNote(detail.data) : null;
-  if (detailNote) return { ...detailNote, xsecToken: detailNote.xsecToken ?? xsecToken };
+  }).catch((err) => {
+    detailFailures.push(`note 调用异常：${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  });
+  if (detail?.ok && detail.data) {
+    const n = normalizeNote(detail.data);
+    if (n) return { ...n, xsecToken: n.xsecToken ?? xsecToken };
+  }
+  if (detail && !detail.ok) detailFailures.push(`note ${detail.error}`);
 
   // 3) SSR 页面 __INITIAL_STATE__
   try {
@@ -141,9 +169,12 @@ async function fetchNoteDetail(noteId: string, xsecToken: string | null): Promis
       const first = Array.isArray(n) ? n.find((x) => x?.note)?.note : undefined;
       const normalized = first ? normalizeNote(first) : null;
       if (normalized) return { ...normalized, xsecToken: normalized.xsecToken ?? xsecToken };
+      detailFailures.push('SSR 页面里没有笔记数据（多半被风控替换成错误页了）');
+    } else {
+      detailFailures.push('SSR 页面取不到（HTTP 非 200）');
     }
   } catch (err) {
-    logger.debug({ err }, 'SSR 详情解析失败');
+    detailFailures.push(`SSR 异常：${err instanceof Error ? err.message : String(err)}`);
   }
 
   return null;
@@ -446,34 +477,56 @@ export async function scrapeAuthor(opts: ScrapeOptions): Promise<ScrapeResult> {
 
   /* --- 2. 列出全部笔记（多级降级）--- */
   let listed: ListedNote[] | null = null;
+  const attempts: string[] = [];
 
-  const viaApi = await listNotesViaApi(userId, xsecToken, maxNotes, onProgress).catch(() => null);
+  const viaApi = await listNotesViaApi(userId, xsecToken, maxNotes, onProgress).catch((err) => {
+    attempts.push(`签名 API 抛错：${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  });
   if (viaApi && viaApi.length > 0) {
     listed = viaApi;
     usedVia.push('signed-api:user_posted');
   } else {
+    attempts.push(...takeEndpointFailures());
     logEvent('fallback', '笔记列表 API 不可用，降级到 SSR 页面解析', { severity: 'warn' });
-    const viaSsr = await listNotesViaSsr(userId).catch(() => null);
+
+    const viaSsr = await listNotesViaSsr(userId).catch((err) => {
+      attempts.push(`SSR 抛错：${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    });
     if (viaSsr && viaSsr.length > 0) {
       listed = viaSsr;
       usedVia.push('ssr:initial-state');
     } else {
+      attempts.push('SSR 页面里没找到作品列表（可能被风控替换成错误页）');
       logEvent('fallback', 'SSR 也没拿到作品列表，降级到滚动页面', { severity: 'warn' });
-      const viaDom = await listNotesViaDomScroll(userId, maxNotes).catch(() => null);
+
+      const viaDom = await listNotesViaDomScroll(userId, maxNotes).catch((err) => {
+        attempts.push(`滚动抛错：${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      });
       if (viaDom && viaDom.length > 0) {
         listed = viaDom;
         usedVia.push('dom:scroll');
+      } else {
+        attempts.push('页面滚动后仍未渲染出作品卡片');
       }
     }
   }
 
   if (!listed || listed.length === 0) {
+    // 把真实原因顶到最前面 —— 风控一眼可见，而不是只丢一句「降级失败」
+    const reason = attempts.length ? attempts.join("；") : "未知原因";
+    logEvent('error', `抓取失败：${reason}`, {
+      severity: 'error',
+      detail: { sourceId, attempts },
+    });
     run(
       "UPDATE sources SET status='error', last_error=?, updated_at=datetime('now') WHERE id=?",
-      '三级降级全部失败：API / SSR / 滚动都没拿到作品列表',
+      `抓取失败 —— ${reason}`,
       sourceId,
     );
-    throw new Error('抓不到作品列表 —— 三级降级全部失败，请检查登录态是否有效');
+    throw new Error(`抓不到作品列表。实际原因：${reason}`);
   }
 
   const target = listed.slice(0, maxNotes);
@@ -482,6 +535,7 @@ export async function scrapeAuthor(opts: ScrapeOptions): Promise<ScrapeResult> {
   /* --- 3. 逐篇抓详情 + 下载图片 --- */
   let stored = 0;
   let skipped = 0;
+  let consecutiveDetailFailures = 0;
 
   for (const [i, item] of target.entries()) {
     if (signal?.aborted) break;
@@ -500,11 +554,33 @@ export async function scrapeAuthor(opts: ScrapeOptions): Promise<ScrapeResult> {
     onProgress({ phase: 'detail', done: i + 1, total: target.length, noteId: item.noteId });
 
     const note = await fetchNoteDetail(item.noteId, item.xsecToken).catch(() => null);
+
+    // 连续多篇拿不到内容，说明不是偶发问题，而是账号/风控层面的整体封锁。
+    // 此时继续往下跑毫无意义 —— 每篇要走 3 条降级、每次都要过节流，
+    // 30 篇能白耗十分钟。撞够阈值就立刻停，并把真实原因报上去。
     if (!note) {
       skipped++;
-      logEvent('fallback', `笔记 ${item.noteId} 三级详情降级全部失败`, { severity: 'info' });
+      consecutiveDetailFailures++;
+      if (consecutiveDetailFailures >= 4) {
+        const reasons = takeDetailFailures();
+        const reason = reasons.length
+          ? reasons.slice(0, 4).join('；')
+          : '所有降级路径都没拿到内容';
+        const msg =
+          `连续 ${consecutiveDetailFailures} 篇笔记全部取不到内容，已中止抓取。` +
+          `典型原因：账号被风控（300011）或签名失效。实际返回：${reason}`;
+        logEvent('error', msg, { severity: 'error', detail: { sourceId, reasons } });
+        run(
+          "UPDATE sources SET status='error', last_error=?, updated_at=datetime('now') WHERE id=?",
+          msg,
+          sourceId,
+        );
+        throw new Error(msg);
+      }
       continue;
     }
+
+    consecutiveDetailFailures = 0;
 
     // 只要图文，视频笔记对这个项目没有意义
     if (note.type === 'video' && note.images.length === 0) {

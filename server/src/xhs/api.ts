@@ -149,14 +149,35 @@ export function noteUrl(noteId: string, xsecToken?: string | null): string {
   return xsecToken ? `${base}?xsec_token=${encodeURIComponent(xsecToken)}&xsec_source=pc_feed` : base;
 }
 
+/** 小红书业务错误码 → 人话。风控类必须能一眼看出来，不然用户只会看到「降级链失败」。 */
+export function explainCode(code: number, msg?: string): string {
+  switch (code) {
+    case 300011:
+      return '账号被风控标记（300011 当前账号存在异常）—— 请换个账号，或等风控解除后再抓';
+    case 300012:
+      return 'IP 被风控（300012 IP存在风险）—— 请切换网络环境';
+    case -101:
+      return '未登录或登录态已过期 —— 请重新扫码登录';
+    case -1:
+      return '请求被拒绝（code=-1）—— 通常是签名失效或账号异常';
+    case -104:
+      return '账号权限受限（-104）—— 该账号可能没有抓取权限';
+    default:
+      return msg ? `业务错误 code=${code}：${msg}` : `业务错误 code=${code}`;
+  }
+}
+
 /**
  * 逐个尝试一串同义端点，第一个成功的就用它。
  * 小红书在 user_posted / user/posted 之间反复横跳，这个降级是刚需。
+ *
+ * 失败原因会被收集起来 —— 排查时「到底为什么不行」比「失败了」有用得多。
  */
 export async function tryEndpoints<T>(
   paths: readonly string[],
   opts: { method?: 'GET' | 'POST'; params?: Record<string, string>; body?: unknown },
 ): Promise<{ result: ApiResponse<T>; via: string } | null> {
+  const failures: string[] = [];
   for (const p of paths) {
     const result = await signedFetch<T>(p, opts);
     if (result?.ok && result.data) {
@@ -164,11 +185,22 @@ export async function tryEndpoints<T>(
       return { result, via: p };
     }
     if (result) {
+      failures.push(`${p}: ${result.error ?? `HTTP ${result.status}`}`);
       logEvent('fallback', `${p} 不可用：${result.error}`, {
         severity: 'info',
         detail: { path: p, status: result.status },
       });
+    } else {
+      failures.push(`${p}: 签名不可用`);
     }
   }
+  lastEndpointFailures = failures;
   return null;
+}
+
+let lastEndpointFailures: string[] = [];
+export function takeEndpointFailures(): string[] {
+  const out = lastEndpointFailures;
+  lastEndpointFailures = [];
+  return out;
 }

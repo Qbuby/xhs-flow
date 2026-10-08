@@ -208,6 +208,17 @@ async function claimNext(): Promise<{ id: number; type: JobType; payload: JobPay
   return { id: row.id, type: row.type, payload };
 }
 
+/**
+ * 这些失败重试也没用 —— 短时间内不会自己好，重试只会反复撞风控，
+ * 徒增被封号的概率。命中就直接判死，把额度留给真正可重试的错误。
+ */
+const NON_RETRYABLE =
+  /300011|300012|当前账号存在异常|IP存在风险|无登录信息|未登录|账号被风控|签名失效|签名不可用/;
+
+function isNonRetryable(message: string): boolean {
+  return NON_RETRYABLE.test(message);
+}
+
 async function execute(job: { id: number; type: JobType; payload: JobPayload }): Promise<void> {
   const handler = handlers[job.type];
   if (!handler) {
@@ -232,16 +243,23 @@ async function execute(job: { id: number; type: JobType; payload: JobPayload }):
       job.id,
     );
     const exhausted = (jobRow?.attempts ?? 0) >= (jobRow?.max_attempts ?? 3);
+    const hopeless = isNonRetryable(message);
 
-    if (exhausted) {
+    if (exhausted || hopeless) {
       run(
         `UPDATE jobs SET status='failed', last_error=?, finished_at=datetime('now') WHERE id=?`,
         message,
         job.id,
       );
-      logEvent('error', `任务 ${job.type} 彻底失败：${message}`, { severity: 'error', detail: { jobId: job.id } });
+      logEvent(
+        'error',
+        hopeless
+          ? `任务 ${job.type} 判定为不可重试：${message.slice(0, 200)}`
+          : `任务 ${job.type} 彻底失败：${message.slice(0, 200)}`,
+        { severity: 'error', detail: { jobId: job.id } },
+      );
     } else {
-      // 指数退避重试，最多 3 次
+      // 指数退避重试
       const backoffMin = Math.min(60, 2 ** (jobRow?.attempts ?? 1) * 5);
       run(
         `UPDATE jobs SET status='pending', last_error=?, run_at=datetime('now', ?) WHERE id=?`,
@@ -254,6 +272,35 @@ async function execute(job: { id: number; type: JobType; payload: JobPayload }):
     recordRunLog('error', job.type, message.slice(0, 500));
     logger.error({ jobId: job.id, type: job.type, err }, '任务失败');
   }
+}
+
+/**
+ * 进程被强杀 / 断电时，会留下一批卡在 running 的僵尸任务 ——
+ * 它们永远不会再被 claim，也永远不会结束。启动时统一回收。
+ */
+function reclaimOrphanJobs(): number {
+  const orphans = all<{ id: number }>(`SELECT id FROM jobs WHERE status = 'running'`);
+  if (orphans.length === 0) return 0;
+  for (const o of orphans) {
+    const row = get<{ attempts: number; max_attempts: number }>(
+      'SELECT attempts, max_attempts FROM jobs WHERE id = ?',
+      o.id,
+    );
+    const exhausted = (row?.attempts ?? 0) >= (row?.max_attempts ?? 3);
+    if (exhausted) {
+      run(
+        `UPDATE jobs SET status='failed', last_error='进程异常退出，任务未完成', finished_at=datetime('now') WHERE id=?`,
+        o.id,
+      );
+    } else {
+      run(
+        `UPDATE jobs SET status='pending', last_error='进程异常退出，任务被回收重排队', run_at=datetime('now') WHERE id=?`,
+        o.id,
+      );
+    }
+  }
+  logger.warn({ count: orphans.length }, '回收了上次异常退出遗留的僵尸任务');
+  return orphans.length;
 }
 
 async function tick(): Promise<void> {
@@ -303,6 +350,7 @@ function activeSourceIds(): number[] {
 
 export function startScheduler(): void {
   stopped = false;
+  reclaimOrphanJobs();
   setInterval(() => void tick(), 15_000).unref?.();
 
   // 定时创作：为每个活跃源产一篇
