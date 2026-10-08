@@ -345,6 +345,7 @@ export async function renderCard(card: Card, opts: RenderOptions): Promise<strin
           author: '',
           sourceProvider: 'preset',
           sourceUrl: '',
+          license: '',
         };
       } else if (opts.allowStock !== false) {
         picked = (await searchStock(toSearchHint(query), 1))[0];

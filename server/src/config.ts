@@ -63,6 +63,7 @@ export interface AppConfig {
   stock: {
     unsplashKey: string;
     pexelsKey: string;
+    pixabayKey: string;
   };
   scrape: {
     concurrency: number;
@@ -100,6 +101,7 @@ export const config: AppConfig = {
   stock: {
     unsplashKey: str(process.env.UNSPLASH_ACCESS_KEY),
     pexelsKey: str(process.env.PEXELS_API_KEY),
+    pixabayKey: str(process.env.PIXABAY_API_KEY),
   },
 
   scrape: {
@@ -128,8 +130,6 @@ export function describeMissingConfig(): string[] {
   if (!llmIsConfigured()) {
     missing.push('文本模型未配置（需要 XHSFLOW_LLM_API_KEY，baseURL 与 key 需成对）');
   }
-  if (!config.stock.unsplashKey && !config.stock.pexelsKey) {
-    missing.push('未配置图库 key —— 配图将只使用纯文字排版卡');
-  }
+  // wikimedia 免 key，永远可用，所以这里不再提示缺 key
   return missing;
 }
