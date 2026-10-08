@@ -192,8 +192,15 @@ export function Dashboard() {
           <div>
             <div className="text-xs text-ink-500 mb-1.5">配图来源</div>
             <div className="text-sm font-medium">
-              {health?.stockProviders.length ? health.stockProviders.join(' + ') : '仅文字排版'}
+              {health?.stockProviders.length
+                ? health.stockProviders.map((p) => p.name).join(' → ')
+                : '仅文字排版'}
             </div>
+            {health?.stockProviders.some((p) => p.keyless) && (
+              <div className="text-[11px] text-ink-400 mt-0.5">
+                含免 key 兜底源
+              </div>
+            )}
           </div>
         </div>
 

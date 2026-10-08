@@ -223,12 +223,15 @@ class PixabayProvider implements StockProvider {
 /* 调度                                                                */
 /* ------------------------------------------------------------------ */
 
-// 顺序即优先级：免 key 的排前面，配了 key 的品质更好时排后面
+// 优先级：配了 key 的优先（素材更像生活方式摄影、品牌感更强），
+// 免 key 的 Wikimedia 兜底，保证一个 key 都不填也能跑。
+const PROVIDER_ORDER = ['pexels', 'pixabay', 'unsplash', 'wikimedia'] as const;
+
 const providers: StockProvider[] = [
-  new WikimediaProvider(),
   new PexelsProvider(),
   new PixabayProvider(),
   new UnsplashProvider(),
+  new WikimediaProvider(),
 ];
 
 export function allProviders(): StockProvider[] {

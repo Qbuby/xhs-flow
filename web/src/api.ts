@@ -44,7 +44,7 @@ export interface Health {
   llm: { profile: string; baseURL: string; model: string; hasKey: boolean };
   llmConfigured: boolean;
   llmMissing: string[];
-  stockProviders: string[];
+  stockProviders: { name: string; keyless: boolean }[];
   browser: { running: boolean; hasSession: boolean; unknown?: boolean; missingCookies: string[]; lastCheckedAt?: string | null };
   signer: { ready: boolean; diagnostic: string };
   scheduler: {

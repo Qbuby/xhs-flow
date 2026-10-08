@@ -54,7 +54,10 @@ export async function buildServer() {
       llm: llmInfo(),
       llmConfigured: llmIsConfigured(),
       llmMissing: describeMissingConfig(),
-      stockProviders: activeProviders().map((p) => p.name),
+      stockProviders: activeProviders().map((p) => ({
+        name: p.name,
+        keyless: p.keyless,
+      })),
       browser: {
         running: browser.isRunning(),
         hasSession: snap?.hasSession ?? lastKnown?.hasSession ?? false,
