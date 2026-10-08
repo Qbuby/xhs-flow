@@ -213,7 +213,7 @@ async function claimNext(): Promise<{ id: number; type: JobType; payload: JobPay
  * 徒增被封号的概率。命中就直接判死，把额度留给真正可重试的错误。
  */
 const NON_RETRYABLE =
-  /300011|300012|当前账号存在异常|IP存在风险|无登录信息|未登录|账号被风控|签名失效|签名不可用/;
+  /300011|300012|300013|当前账号存在异常|IP存在风险|访问频繁|无登录信息|未登录|账号被风控|签名失效|签名不可用/;
 
 function isNonRetryable(message: string): boolean {
   return NON_RETRYABLE.test(message);

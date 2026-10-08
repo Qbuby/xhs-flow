@@ -11,7 +11,7 @@ import {
 import {
   harvestNoteList,
   harvestedProfile,
-  readNotePage,
+  createNoteReader,
   toScrapedNote,
 } from './scrape-browser.js';
 import { logger } from '../logger.js';
@@ -332,46 +332,53 @@ function upsertSource(profileUrl: string, patch: Partial<Record<string, unknown>
 }
 
 async function storeNoteImages(notePk: number, images: string[]): Promise<void> {
-  const mediaDir = await import('../config.js').then((m) => m.MEDIA_DIR);
+  const { MEDIA_DIR } = await import('../config.js');
   const path = await import('node:path');
+  const fs = await import('node:fs/promises');
+  const { createHash } = await import('node:crypto');
 
-  for (const [idx, url] of images.entries()) {
-    const rowId = run(
+  const outDir = path.join(MEDIA_DIR, 'corpus', String(notePk));
+  await fs.mkdir(outDir, { recursive: true });
+
+  // 并行下载：每篇 3 张图串行是 3 个来回，并行后基本一波拉完
+  await Promise.all(images.map((url, idx) => downloadOne(notePk, idx, url)));
+
+  async function downloadOne(pk: number, idx: number, url: string): Promise<void> {
+    const inserted = run(
       `INSERT INTO note_images(note_id, idx, remote_url, is_cover) VALUES (?, ?, ?, ?)
        ON CONFLICT(note_id, idx) DO NOTHING`,
-      notePk,
+      pk,
       idx,
       url,
       idx === 0 ? 1 : 0,
-    ).changes;
-    if (rowId === 0) continue; // 已存在
+    );
+    if (inserted.changes === 0) return; // 已经下过了
 
     try {
-      const buf = await downloadImage(url);
-      const file = path.join(mediaDir, `corpus`, `${notePk}-${idx}.jpg`);
-      const meta = await sharp(buf)
+      const raw = await downloadImage(url);
+      const buf = await sharp(raw)
         .resize(1080, 1440, { fit: 'cover', position: 'centre' })
         .jpeg({ quality: 88, mozjpeg: true })
         .toBuffer();
-      const { createHash } = await import('node:crypto');
-      const fs = await import('node:fs');
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, meta);
-      const metaInfo = await sharp(meta).metadata();
-      const stats = await sharp(meta).stats();
+
+      const file = path.join(outDir, `${idx}.jpg`);
+      await fs.writeFile(file, buf);
+
+      const info = await sharp(buf).metadata();
+      const stats = await sharp(buf).stats();
       const bright = stats.channels.map((c) => c.mean).reduce((a, b) => a + b, 0) / 255 / 3;
 
       run(
-        `UPDATE note_images SET local_path = ?, width = ?, height = ?, bytes = ?, sha256 = ?, palette = ?, brightness = ?
-         WHERE note_id = ? AND idx = ?`,
+        `UPDATE note_images SET local_path = ?, width = ?, height = ?, bytes = ?, sha256 = ?,
+           palette = ?, brightness = ? WHERE note_id = ? AND idx = ?`,
         file,
-        metaInfo.width ?? 1080,
-        metaInfo.height ?? 1440,
-        meta.length,
-        createHash('sha256').update(meta).digest('hex'),
-        JSON.stringify(await extractPalette(meta)),
+        info.width ?? 1080,
+        info.height ?? 1440,
+        buf.length,
+        createHash('sha256').update(buf).digest('hex'),
+        JSON.stringify(await extractPalette(buf)),
         bright,
-        notePk,
+        pk,
         idx,
       );
     } catch (err) {
@@ -380,12 +387,16 @@ async function storeNoteImages(notePk: number, images: string[]): Promise<void> 
   }
 }
 
+
 /** 用 sharp 取主色板 —— 不依赖 LLM 看图，快且零 token。 */
 async function extractPalette(buf: Buffer): Promise<Array<{ hex: string; weight: number }>> {
   try {
-    const { data } = await sharp(buf).resize(64, 64, { fit: 'cover' }).removeAlpha().raw().toBuffer({
-      resolveWithObject: true,
-    });
+    const { data } = await sharp(buf)
+      .resize(64, 64, { fit: 'cover' })
+      .removeAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
     const buckets = new Map<number, number>();
     for (let i = 0; i < data.length; i += 3) {
       const r = data[i] ?? 0;
@@ -576,6 +587,9 @@ export async function scrapeAuthor(opts: ScrapeOptions): Promise<ScrapeResult> {
   let skipped = 0;
   let consecutiveDetailFailures = 0;
 
+  // 标签页常驻复用，不再一篇一个
+  const reader = await createNoteReader();
+
   for (const [i, item] of target.entries()) {
     if (signal?.aborted) break;
 
@@ -593,7 +607,8 @@ export async function scrapeAuthor(opts: ScrapeOptions): Promise<ScrapeResult> {
     onProgress({ phase: 'detail', done: i + 1, total: target.length, noteId: item.noteId });
 
     // 优先用浏览器读页面（和列表同一个思路：页面能过的，我们就能过）
-    let note = await readNotePage(item.noteId, item.xsecToken)
+    let note = await reader
+      .read(item.noteId, item.xsecToken)
       .then((dom) => (dom ? toScrapedNote({ noteId: item.noteId, xsecToken: item.xsecToken }, dom) : null))
       .catch(() => null);
 
@@ -675,6 +690,8 @@ export async function scrapeAuthor(opts: ScrapeOptions): Promise<ScrapeResult> {
     stored++;
     onProgress({ phase: 'detail', done: i + 1, total: target.length, noteId: note.noteId });
   }
+
+  await reader.close().catch(() => undefined);
 
   const count = get<{ c: number }>('SELECT COUNT(*) AS c FROM notes WHERE source_id = ?', sourceId);
   run(

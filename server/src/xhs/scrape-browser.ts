@@ -22,6 +22,33 @@ import type { ScrapedNote } from './scrape.js';
  *  - 全程是正常浏览行为，比裸调 API 更不容易触发风控
  */
 
+/**
+ * 被小红书限流（300013 访问频繁）。
+ * 单独一个错误类型，是为了让上层能把它判成「不可重试」——
+ * 等几分钟重试只会继续撞墙、继续加重标记。
+ */
+export class RATE_LIMITED extends Error {
+  readonly rateLimited = true;
+  constructor(message: string) {
+    super(message);
+    this.name = 'RateLimitedError';
+  }
+}
+
+/** 轮询等待条件成立；超时返回 false。 */
+async function waitFor(
+  cond: () => boolean | Promise<boolean>,
+  opts: { timeout: number; interval?: number },
+): Promise<boolean> {
+  const step = opts.interval ?? 200;
+  const deadline = Date.now() + opts.timeout;
+  for (;;) {
+    if (await cond()) return true;
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, step));
+  }
+}
+
 export interface HarvestedNote {
   noteId: string;
   xsecToken: string | null;
@@ -128,24 +155,43 @@ export async function harvestNoteList(
       waitUntil: 'domcontentloaded',
       timeout: 60_000,
     });
-    // 弹登录框会挡住内容，关掉
     await dismissLoginModal(page);
-    await page.waitForTimeout(4000);
+    await page.waitForTimeout(2500);
 
+    // 这里等的是**页面自己把下一页数据拉回来**，不是干等。
+    // 原来每次滚动都 throttle(6s)，40 轮下来光列表就要 5 分钟。
     let stagnant = 0;
-    for (let round = 0; round < 40 && byId.size < max; round++) {
+    const MAX_ROUNDS = 80;
+    for (let round = 0; round < MAX_ROUNDS && byId.size < max; round++) {
       const before = byId.size;
-      await page.mouse.wheel(0, 2600);
-      await page.waitForTimeout(1500 + Math.random() * 900);
+      await page.mouse.wheel(0, 3200);
+
+      // 等新数据出现：要么数量涨了，要么确认到底了
+      const grew = await waitFor(
+        async () => byId.size > before,
+        { timeout: 8000, interval: 200 },
+      );
       await dismissLoginModal(page);
 
+      // 滚动到一半被限流了就别硬撑，立刻报错
+      if (byId.size === before && round > 2) {
+        const probe = await page.locator('body').innerText().catch(() => '');
+        if (/访问频繁|请稍后再试|300013/.test(probe)) {
+          throw new RATE_LIMITED(
+            `小红书在翻页时判定访问过于频繁（300013），已停止。已采集 ${byId.size} 条。`,
+          );
+        }
+      }
+
       if (byId.size === before) {
-        if (++stagnant >= 4) break;
+        if (++stagnant >= 3) break;
       } else {
         stagnant = 0;
-        // 每翻一页稍作停留，别把节奏搞得像机器人
-        await throttle();
       }
+
+      onProgress?.(byId.size);
+      // 滚动节奏本身就有随机性，不必再叠加固定延迟。
+      // 真要给风控让路，靠并发度而不是每步 sleep。
     }
 
     // 作者资料兜底：从主页的 __INITIAL_STATE__ 里取
@@ -178,6 +224,12 @@ export async function harvestNoteList(
 
     if (byId.size === 0) {
       const text = await page.locator('body').innerText().catch(() => '');
+      if (/访问频繁|请稍后再试|300013/.test(text)) {
+        throw new RATE_LIMITED(
+          '小红书判定为访问过于频繁（300013）。刚抓过的话等一段时间再试，' +
+            '建议把「最多篇数」调小、分批抓取。',
+        );
+      }
       if (/IP存在风险|安全限制|Whitelabel/.test(text)) {
         throw new Error('主页被风控拦截（IP 风险 / 安全限制），请更换网络环境');
       }
@@ -223,99 +275,187 @@ interface DomNote {
 }
 
 /**
- * 打开笔记页并读取渲染后的内容。
- * 必须带 xsec_token，否则小红书会显示「当前笔记暂时无法浏览」。
+ * 笔记读取器：**复用同一个标签页**。
+ *
+ * 原来每篇笔记都 newPage → goto → 固定睡 3.5s → close，
+ * 一篇 8~10 秒，150 篇就是二十多分钟，全花在开关标签页和干等上。
+ * 现在标签页常驻，且改成「等数据真的出现」而不是「睡够 3.5 秒」。
  */
-export async function readNotePage(noteId: string, xsecToken: string | null): Promise<DomNote | null> {
+export interface NoteReader {
+  read(noteId: string, xsecToken: string | null): Promise<DomNote | null>;
+  close(): Promise<void>;
+}
+
+export async function createNoteReader(): Promise<NoteReader> {
   const ctx = await browser.ensureLaunched();
   const page = await ctx.newPage();
 
-  const qs = xsecToken
-    ? `?xsec_token=${encodeURIComponent(xsecToken)}&xsec_source=pc_user`
-    : '';
-  const url = `${XHS_ORIGIN}/explore/${noteId}${qs}`;
+  return {
+    async read(noteId: string, xsecToken: string | null): Promise<DomNote | null> {
+      const qs = xsecToken
+        ? `?xsec_token=${encodeURIComponent(xsecToken)}&xsec_source=pc_user`
+        : '';
+      await page.goto(`${XHS_ORIGIN}/explore/${noteId}${qs}`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 45_000,
+      });
+      await dismissLoginModal(page);
 
-  try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    await dismissLoginModal(page);
-    await page.waitForTimeout(3500);
+      // 等正文真的渲染出来，而不是固定睡几秒赌它够了。
+      // 有 xsec_token 时通常 1 秒内就有 __INITIAL_STATE__。
+      await waitFor(() => hasNoteData(page), { timeout: 12_000, interval: 150 });
 
-    const data = (await page.evaluate(() => {
-      // 首选页面自己的 __INITIAL_STATE__ —— 结构化且完整。
-      // 从 <img> 标签里猜不靠谱：DOM 里混着轮播缩略图和「相关推荐」封面，
-      // 按尺寸过滤也还是会多收，实测一篇笔记能数出 30 多张图。
-      const state = (window as unknown as { __INITIAL_STATE__?: Record<string, any> })
-        .__INITIAL_STATE__;
-      const dm = (state?.note as Record<string, any>)?.noteDetailMap;
-      const note = Array.isArray(dm) ? dm.find((x) => x?.note)?.note : undefined;
+      const data = (await page.evaluate(EXTRACT_NOTE)) as
+        | ExtractNoteOk
+        | ExtractNoteMissing;
 
-      if (note) {
-        return {
-          ok: true as const,
-          title: note.title ?? '',
-          desc: note.desc ?? '',
-          tags: (note.tagList ?? []).map((t: any) => t?.title ?? t?.name ?? '').filter(Boolean),
-          images: (note.imageList ?? [])
-            .map((i: any) => i?.urlDefault ?? i?.url_default ?? i?.url ?? '')
-            .filter(Boolean),
-          time: Number(note.time) || null,
-          liked: Number(note.interactInfo?.likedCount) || 0,
-          collected: Number(note.interactInfo?.collectedCount) || 0,
-          comment: Number(note.interactInfo?.commentCount) || 0,
-        };
-      }
-
-      // 退路：SSR 没给数据就用渲染后的 DOM
-      const txt = (sel: string) =>
-        (document.querySelector(sel) as HTMLElement | null)?.textContent?.trim() ?? '';
-      const whole = document.body.innerText ?? '';
-      if (/当前笔记暂时无法浏览|内容不存在|笔记不见了/.test(whole)) {
-        return { ok: false as const, gone: true };
-      }
-      return {
-        ok: true as const,
-        title: txt('#detail-title') || txt('.note-content .title'),
-        desc: txt('#detail-desc') || txt('.note-content .desc'),
-        tags: Array.from(document.querySelectorAll('#detail-desc a'))
-          .map((a) => (a.textContent ?? '').replace(/^#/, '').trim())
-          .filter(Boolean),
-        images: Array.from(document.querySelectorAll('img'))
-          .filter((i) => i.naturalWidth >= 900 && i.naturalHeight >= 900)
-          .map((i) => i.getAttribute('src') ?? '')
-          .filter(Boolean),
-        time: null,
-        liked: 0,
-        collected: 0,
-        comment: 0,
-      };
-    })) as
-      | {
-          ok: true;
-          title: string;
-          desc: string;
-          tags: string[];
-          images: string[];
-          time: number | null;
-          liked: number;
-          collected: number;
-          comment: number;
+      if (!data.ok) {
+        if (data.throttled) {
+          throw new RATE_LIMITED(
+            '小红书判定为访问过于频繁（300013），已停止抓取。等一段时间再试，' +
+              '或者把「最多篇数」调小、分批抓取。',
+          );
         }
-      | { ok: false; gone: boolean };
+        return null;
+      }
 
-    if (!data.ok) return null;
+      return {
+        title: data.title || '',
+        desc: data.desc || '',
+        tags: [...new Set(data.tags ?? [])],
+        images: [...new Set(data.images ?? [])],
+        publishedAt: data.time ?? null,
+        liked: data.liked ?? 0,
+        collected: data.collected ?? 0,
+        comment: data.comment ?? 0,
+      };
+    },
 
+    async close() {
+      await page.close().catch(() => undefined);
+    },
+  };
+}
+
+/**
+ * 页面上是否已经有可读的笔记数据了。
+ *
+ * 注意：图片是**懒加载**的，如果只等正文就立刻取图，
+ * naturalWidth 还是 0，会一张都收不到（实测 198 篇全 0 图）。
+ * 所以这里同时等「至少有一张大图完成解码」。
+ */
+function hasNoteData(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const s = (window as unknown as { __INITIAL_STATE__?: Record<string, any> }).__INITIAL_STATE__;
+    const dm = (s?.note as Record<string, any>)?.noteDetailMap;
+    if (Array.isArray(dm) && dm.some((x) => x?.note?.desc || x?.note?.title)) return true;
+    if ((document.querySelector('#detail-desc')?.textContent ?? '').trim().length > 5) return true;
+    if (/当前笔记暂时无法浏览|内容不存在/.test(document.body.innerText ?? '')) return true;
+    // 有已解码的大图 = 内容确实渲染出来了
+    return Array.from(document.querySelectorAll('img')).some((i) => i.naturalWidth >= 600);
+  });
+}
+
+type ExtractNoteMissing = { ok: false; gone: boolean; throttled: boolean };
+
+type ExtractNoteOk = {
+  ok: true;
+  title: string;
+  desc: string;
+  tags: string[];
+  images: string[];
+  time: number | null;
+  liked: number;
+  collected: number;
+  comment: number;
+};
+
+/**
+ * 取正文。首选页面自己的 __INITIAL_STATE__ —— 结构化且完整。
+ * 从 <img> 标签里猜不靠谱：DOM 里混着轮播缩略图和「相关推荐」封面，
+ * 按尺寸过滤也还是会多收，实测一篇笔记能数出 30 多张图。
+ */
+const EXTRACT_NOTE = (): ExtractNoteOk | ExtractNoteMissing => {
+  const state = (window as unknown as { __INITIAL_STATE__?: Record<string, any> }).__INITIAL_STATE__;
+  const dm = (state?.note as Record<string, any>)?.noteDetailMap;
+  const note = Array.isArray(dm) ? dm.find((x) => x?.note)?.note : undefined;
+
+  if (note) {
     return {
-      title: data.title || '',
-      desc: data.desc || '',
-      tags: [...new Set(data.tags ?? [])],
-      images: [...new Set(data.images ?? [])],
-      publishedAt: data.time ?? null,
-      liked: data.liked ?? 0,
-      collected: data.collected ?? 0,
-      comment: data.comment ?? 0,
+      ok: true,
+      title: note.title ?? '',
+      desc: note.desc ?? '',
+      tags: (note.tagList ?? []).map((t: any) => t?.title ?? t?.name ?? '').filter(Boolean),
+      images: (note.imageList ?? [])
+        .map((i: any) => i?.urlDefault ?? i?.url_default ?? i?.url ?? '')
+        .filter(Boolean),
+      time: Number(note.time) || null,
+      liked: Number(note.interactInfo?.likedCount) || 0,
+      collected: Number(note.interactInfo?.collectedCount) || 0,
+      comment: Number(note.interactInfo?.commentCount) || 0,
     };
+  }
+
+  const txt = (sel: string) =>
+    (document.querySelector(sel) as HTMLElement | null)?.textContent?.trim() ?? '';
+  const whole = document.body.innerText ?? '';
+  // 限流页（300013 访问频繁）必须识别出来。否则会一路读到几十上百篇空笔记，
+  // 看起来像「图片抓不到」，实际是被风控挡了，纯属白跑。
+  if (/访问频繁|请稍后再试|300013/.test(whole)) {
+    return { ok: false, gone: false, throttled: true };
+  }
+  if (/当前笔记暂时无法浏览|内容不存在|笔记不见了/.test(whole)) {
+    return { ok: false, gone: true, throttled: false };
+  }
+
+  const all = Array.from(document.querySelectorAll('img'));
+  // 优先用已解码的尺寸判断；图还没解码完就退回按 URL 特征挑
+  let images = all
+    .filter((i) => i.naturalWidth >= 900 && i.naturalHeight >= 900)
+    .map((i) => i.getAttribute('src') ?? '');
+  if (images.length === 0) {
+    images = all
+      .map((i) => i.getAttribute('src') ?? '')
+      .filter(
+        (src) =>
+          (src.includes('sns-img') || src.includes('sns-webpic') || src.includes('ci.xiaohongshu')) &&
+          !/avatar|icon|qrcode|logo|default_/i.test(src),
+      );
+  }
+
+  // 互动数只能从 DOM 上抠（小红书的赞藏评在 .engage-bar / .interact-container 里）
+  const numOf = (root: string): number => {
+    const el = document.querySelector(root);
+    const n = Number((el?.textContent ?? '').replace(/[^\d.]/g, ''));
+    return Number.isFinite(n) ? n : 0;
+  };
+  const timeEl = document.querySelector('[class*="date"], [class*="time"]');
+
+  return {
+    ok: true,
+    title: txt('#detail-title') || txt('.note-content .title'),
+    desc: txt('#detail-desc') || txt('.note-content .desc'),
+    tags: Array.from(document.querySelectorAll('#detail-desc a'))
+      .map((a) => (a.textContent ?? '').replace(/^#/, '').trim())
+      .filter(Boolean),
+    images: [...new Set(images.filter(Boolean))],
+    time: timeEl ? Date.parse((timeEl.textContent ?? '').replace(/-/g, '/')) || null : null,
+    liked: numOf('.engage-bar .like-wrapper .count, .like-wrapper .count'),
+    collected: numOf('.engage-bar .collect-wrapper .count, .collect-wrapper .count'),
+    comment: numOf('.engage-bar .chat-wrapper .count, .chat-wrapper .count'),
+  };
+};
+
+/** 兼容旧调用：开一个临时读取器读一篇。 */
+export async function readNotePage(
+  noteId: string,
+  xsecToken: string | null,
+): Promise<DomNote | null> {
+  const reader = await createNoteReader();
+  try {
+    return await reader.read(noteId, xsecToken);
   } finally {
-    await page.close().catch(() => undefined);
+    await reader.close();
   }
 }
 
