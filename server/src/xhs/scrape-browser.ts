@@ -377,30 +377,40 @@ type ExtractNoteOk = {
  */
 const EXTRACT_NOTE = (): ExtractNoteOk | ExtractNoteMissing => {
   const state = (window as unknown as { __INITIAL_STATE__?: Record<string, any> }).__INITIAL_STATE__;
-  const dm = (state?.note as Record<string, any>)?.noteDetailMap;
-  const note = Array.isArray(dm) ? dm.find((x) => x?.note)?.note : undefined;
 
-  if (note) {
+  // ⚠️ noteDetailMap 是**以 note_id 为键的对象**，不是数组。
+  // 之前写成 Array.isArray() 判断，导致整条结构化分支永远进不去，
+  // 所有笔记都掉进 DOM 兜底 —— 于是图片、点赞、收藏全是 0，日期还成了 2001 年。
+  const dm = state?.note?.noteDetailMap;
+  const note = Array.isArray(dm)
+    ? dm.find((x) => x?.note)?.note
+    : dm && typeof dm === 'object'
+      ? (Object.values(dm)[0] as any)?.note ?? (Object.values(dm)[0] as any)
+      : undefined;
+
+  if (note && (note.title || note.desc || note.imageList || note.image_list)) {
     return {
       ok: true,
       title: note.title ?? '',
       desc: note.desc ?? '',
-      tags: (note.tagList ?? []).map((t: any) => t?.title ?? t?.name ?? '').filter(Boolean),
-      images: (note.imageList ?? [])
+      tags: (note.tagList ?? note.tag_list ?? [])
+        .map((t: any) => t?.title ?? t?.name ?? '')
+        .filter(Boolean),
+      images: (note.imageList ?? note.image_list ?? [])
         .map((i: any) => i?.urlDefault ?? i?.url_default ?? i?.url ?? '')
         .filter(Boolean),
       time: Number(note.time) || null,
-      liked: Number(note.interactInfo?.likedCount) || 0,
-      collected: Number(note.interactInfo?.collectedCount) || 0,
-      comment: Number(note.interactInfo?.commentCount) || 0,
+      liked: Number(note.interactInfo?.likedCount ?? note.interact_info?.liked_count) || 0,
+      collected: Number(note.interactInfo?.collectedCount ?? note.interact_info?.collected_count) || 0,
+      comment: Number(note.interactInfo?.commentCount ?? note.interact_info?.comment_count) || 0,
     };
   }
 
   const txt = (sel: string) =>
     (document.querySelector(sel) as HTMLElement | null)?.textContent?.trim() ?? '';
   const whole = document.body.innerText ?? '';
-  // 限流页（300013 访问频繁）必须识别出来。否则会一路读到几十上百篇空笔记，
-  // 看起来像「图片抓不到」，实际是被风控挡了，纯属白跑。
+
+  // 限流页（300013）必须识别出来，否则会一路读出上百篇空笔记
   if (/访问频繁|请稍后再试|300013/.test(whole)) {
     return { ok: false, gone: false, throttled: true };
   }
@@ -408,28 +418,33 @@ const EXTRACT_NOTE = (): ExtractNoteOk | ExtractNoteMissing => {
     return { ok: false, gone: true, throttled: false };
   }
 
-  const all = Array.from(document.querySelectorAll('img'));
-  // 优先用已解码的尺寸判断；图还没解码完就退回按 URL 特征挑
-  let images = all
-    .filter((i) => i.naturalWidth >= 900 && i.naturalHeight >= 900)
-    .map((i) => i.getAttribute('src') ?? '');
-  if (images.length === 0) {
-    images = all
-      .map((i) => i.getAttribute('src') ?? '')
-      .filter(
-        (src) =>
-          (src.includes('sns-img') || src.includes('sns-webpic') || src.includes('ci.xiaohongshu')) &&
-          !/avatar|icon|qrcode|logo|default_/i.test(src),
-      );
+  // DOM 兜底。图片认准 .note-slider-img（轮播容器），比按 naturalWidth 猜可靠得多
+  const sliderImgs = Array.from(document.querySelectorAll('.note-slider-img'))
+    .map((i) => (i as HTMLElement).querySelector('img')?.getAttribute('src') ?? '')
+    .filter(Boolean);
+  const imgs = sliderImgs.length
+    ? sliderImgs
+    : Array.from(document.querySelectorAll('img'))
+        .filter((i) => i.naturalWidth >= 900 && i.naturalHeight >= 900)
+        .map((i) => i.getAttribute('src') ?? '')
+        .filter(Boolean);
+
+  // 页面上的日期形如 "09-23 浙江"，没有年份 —— 硬 parse 会变成 2001 年
+  const dateText = txt('.bottom-container .date') || txt('.date');
+  const dm2 = /(\d{1,2})[-/月](\d{1,2})/.exec(dateText);
+  let ts: number | null = null;
+  if (dm2) {
+    const mo = Number(dm2[1]);
+    const day = Number(dm2[2]);
+    const now = new Date();
+    ts = new Date(now.getFullYear(), mo - 1, day).getTime();
   }
 
-  // 互动数只能从 DOM 上抠（小红书的赞藏评在 .engage-bar / .interact-container 里）
-  const numOf = (root: string): number => {
-    const el = document.querySelector(root);
+  const numOf = (sel: string): number => {
+    const el = document.querySelector(sel);
     const n = Number((el?.textContent ?? '').replace(/[^\d.]/g, ''));
     return Number.isFinite(n) ? n : 0;
   };
-  const timeEl = document.querySelector('[class*="date"], [class*="time"]');
 
   return {
     ok: true,
@@ -438,11 +453,11 @@ const EXTRACT_NOTE = (): ExtractNoteOk | ExtractNoteMissing => {
     tags: Array.from(document.querySelectorAll('#detail-desc a'))
       .map((a) => (a.textContent ?? '').replace(/^#/, '').trim())
       .filter(Boolean),
-    images: [...new Set(images.filter(Boolean))],
-    time: timeEl ? Date.parse((timeEl.textContent ?? '').replace(/-/g, '/')) || null : null,
-    liked: numOf('.engage-bar .like-wrapper .count, .like-wrapper .count'),
-    collected: numOf('.engage-bar .collect-wrapper .count, .collect-wrapper .count'),
-    comment: numOf('.engage-bar .chat-wrapper .count, .chat-wrapper .count'),
+    images: [...new Set(imgs)],
+    time: ts,
+    liked: numOf('.like-wrapper .count'),
+    collected: numOf('.collect-wrapper .count'),
+    comment: numOf('.chat-wrapper .count'),
   };
 };
 
