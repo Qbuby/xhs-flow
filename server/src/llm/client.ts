@@ -92,7 +92,9 @@ function joinText(json: AnthropicResponse): string {
 }
 
 async function chatAnthropic(opts: ChatOptions): Promise<string> {
-  let budget = opts.maxTokens ?? 8192;
+  // 默认给足。这个模型思考很重（实测单篇蒸馏要 6k+ token），
+  // 预算不够会先被截断、再触发 4 倍重试，一次调用就变成两次的耗时。
+  let budget = opts.maxTokens ?? 16_384;
   let json = await callAnthropic(opts, budget);
 
   let out = joinText(json);

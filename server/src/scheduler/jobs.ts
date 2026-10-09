@@ -79,8 +79,26 @@ const handlers: Record<JobType, Handler> = {
   async distill(p) {
     if (!p.sourceId) throw new Error('distill 任务缺少 sourceId');
     const analysis = await analyzeSource(p.sourceId, 60);
-    const profile = await buildStyleProfile(p.sourceId);
-    return { ...analysis, profileBuilt: Boolean(profile) };
+
+    // 作者画像是一次 200 秒量级的大调用，但结果几乎不变。
+    // 只要没有新增笔记、且已有画像，就别重算。
+    const existing = get<{ sample_count: number }>(
+      'SELECT sample_count FROM style_profiles WHERE source_id = ?',
+      p.sourceId,
+    );
+    const styled = get<{ c: number }>(
+      'SELECT COUNT(*) AS c FROM notes n JOIN note_styles ns ON ns.note_id = n.id WHERE n.source_id = ?',
+      p.sourceId,
+    );
+
+    let profileBuilt = false;
+    if (!existing || (styled?.c ?? 0) > existing.sample_count + 2) {
+      const profile = await buildStyleProfile(p.sourceId);
+      profileBuilt = Boolean(profile);
+    } else {
+      logger.info({ sourceId: p.sourceId, sample: styled?.c }, '已有风格画像且无新增笔记，跳过重算');
+    }
+    return { ...analysis, profileBuilt, profileSkipped: !profileBuilt };
   },
 
   async ideate(p) {

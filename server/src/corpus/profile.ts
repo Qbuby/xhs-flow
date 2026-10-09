@@ -134,7 +134,7 @@ export async function buildStyleProfile(sourceId: number): Promise<StyleProfile 
      FROM notes n JOIN note_styles ns ON ns.note_id = n.id
      WHERE n.source_id = ?
      ORDER BY n.liked_count DESC
-     LIMIT 40`,
+     LIMIT 15`,
     sourceId,
   );
 
@@ -151,7 +151,7 @@ export async function buildStyleProfile(sourceId: number): Promise<StyleProfile 
   const evidence = samples
     .map((s, i) => {
       const text = `${s.title}\n${s.desc}`;
-      let a: unknown;
+      let a: any;
       try {
         a = JSON.parse(s.analysis);
       } catch {
@@ -163,7 +163,9 @@ export async function buildStyleProfile(sourceId: number): Promise<StyleProfile 
         `正文：${s.desc.slice(0, 300)}${s.desc.length > 300 ? '…' : ''}`,
         `话题：${JSON.parse(s.tags || '[]').join('、') || '无'}`,
         `字数：${text.length}，emoji ${countEmoji(text)} 个`,
-        `结构化标注：${JSON.stringify(a)}`,
+        `标注摘要：标题公式=${a?.hook?.title_formula ?? '?'}；语气=${JSON.stringify(
+          a?.language?.tone ?? [],
+        )}；骨架=${a?.structure?.pattern ?? '?'}`,
       ].join('\n');
     })
     .join('\n\n');
@@ -191,7 +193,7 @@ export async function buildStyleProfile(sourceId: number): Promise<StyleProfile 
     system: PROFILE_SYSTEM,
     user,
     temperature: 0.35,
-    maxTokens: 8192,
+    maxTokens: 24_576,
   });
 
   const parsed = StyleProfileSchema.safeParse(raw);
