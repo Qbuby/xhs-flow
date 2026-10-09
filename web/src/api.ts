@@ -95,6 +95,7 @@ export interface Draft {
   publish_error: string | null;
   published_url: string | null;
   created_at: string;
+  published_at: string | null;
   nickname: string | null;
 }
 

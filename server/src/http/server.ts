@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import { Cron } from 'croner';
 import cors from '@fastify/cors';
 import fstatic from '@fastify/static';
 import path from 'node:path';
@@ -33,6 +34,24 @@ import { enqueue, schedulerInfo, runNow } from '../scheduler/jobs.js';
 import { approvedDrafts } from '../xhs/publish.js';
 import { llmHealth, llmInfo } from '../llm/client.js';
 import { activeProviders } from '../media/stock.js';
+
+/** 把 cron 表达式翻译成「下一次会是什么时候」，创作台要显示。 */
+function nextRunTimes(): { generate: string | null; publish: string | null } {
+  const gen = getSetting('schedule_generate') ?? config.schedule.generate;
+  const pub = getSetting('schedule_publish') ?? config.schedule.publish;
+  const calc = (p: string): string | null => {
+    if (!p?.trim()) return null;
+    try {
+      const c = new Cron(p, { paused: true });
+      const next = c.nextRun();
+      c.stop();
+      return next ? next.toISOString() : null;
+    } catch {
+      return null;
+    }
+  };
+  return { generate: calc(gen), publish: calc(pub) };
+}
 
 export async function buildServer() {
   const app = Fastify({ logger: false, bodyLimit: 5 * 1024 * 1024 });
@@ -77,16 +96,58 @@ export async function buildServer() {
       generate: getSetting('schedule_generate') ?? config.schedule.generate,
       publish: getSetting('schedule_publish') ?? config.schedule.publish,
       autoPublish: (getSetting('auto_publish') ?? String(config.publish.auto)) === 'true',
+      // 创作台的新配置
+      autoCompose: (getSetting('auto_compose') ?? 'false') === 'true',
+      autoIdeate: (getSetting('auto_ideate') ?? 'true') === 'true',
+      composePerRun: Number(getSetting('compose_per_run') ?? '1'),
+      ideatePerRun: Number(getSetting('ideate_per_run') ?? '6'),
     },
+    nextRun: nextRunTimes(),
   }));
 
   app.post('/api/settings', async (req, reply) => {
-    const body = (req.body ?? {}) as Record<string, string | boolean>;
-    if (typeof body.brand === 'string') setSetting('brand', body.brand);
-    if (typeof body.scheduleGenerate === 'string') setSetting('schedule_generate', body.scheduleGenerate);
-    if (typeof body.schedulePublish === 'string') setSetting('schedule_publish', body.schedulePublish);
-    if (typeof body.autoPublish === 'boolean') setSetting('auto_publish', String(body.autoPublish));
-    return { ok: true };
+    const body = (req.body ?? {}) as Record<string, string | number | boolean>;
+    const setStr = (k: string, v: string | number | boolean | undefined) => {
+      if (v !== undefined) setSetting(k, String(v));
+    };
+    setStr('brand', body.brand);
+    setStr('schedule_generate', body.scheduleGenerate);
+    setStr('schedule_publish', body.schedulePublish);
+    setStr('auto_publish', body.autoPublish);
+    setStr('auto_compose', body.autoCompose);
+    setStr('auto_ideate', body.autoIdeate);
+    setStr('compose_per_run', body.composePerRun);
+    setStr('ideate_per_run', body.ideatePerRun);
+
+    // cron 表达式校验：无效的表达式不该等到下次触发才暴露
+    if (typeof body.scheduleGenerate === 'string' && body.scheduleGenerate.trim()) {
+      try {
+        new Cron(body.scheduleGenerate);
+      } catch {
+        reply.code(400);
+        return { error: `定时创作表达式无效：${body.scheduleGenerate}` };
+      }
+    }
+    return { ok: true, nextRun: nextRunTimes() };
+  });
+
+  /** 创作台：跨语料源的选题总览 */
+  app.get('/api/studio/topics', async () => {
+    const sources = all<{ id: number; nickname: string | null; note_count: number }>(
+      `SELECT id, nickname, note_count FROM sources WHERE status='active' ORDER BY id`,
+    );
+    const topics = all(
+      `SELECT t.*, s.nickname FROM topics t
+       LEFT JOIN sources s ON s.id = t.source_id
+       ORDER BY t.status='open' DESC, t.id DESC LIMIT 200`,
+    );
+    const counts = all<{ source_id: number; open: number; used: number }>(
+      `SELECT source_id,
+              SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open,
+              SUM(CASE WHEN status='used' THEN 1 ELSE 0 END) AS used
+       FROM topics GROUP BY source_id`,
+    );
+    return { sources, topics, counts };
   });
 
   app.get('/api/events', async () => recentEvents(80));

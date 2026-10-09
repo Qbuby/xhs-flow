@@ -56,10 +56,6 @@ export function SourceDetail() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState('');
   const [noteDetail, setNoteDetail] = useState<NoteDetail | null>(null);
-  const [newTopic, setNewTopic] = useState('');
-  const [composeOpen, setComposeOpen] = useState(false);
-  const [composeTopic, setComposeTopic] = useState('');
-  const [composeAngle, setComposeAngle] = useState('');
   const [running, setRunning] = useState<string | null>(null);
   const [hint, setHint] = useState<string | null>(null);
 
@@ -108,8 +104,8 @@ export function SourceDetail() {
     if (!running) return;
     const t = setInterval(async () => {
       try {
-        const j = await api.get<{ type: string; status: string; last_error: string | null }>(
-          `/api/jobs?source=${id}`,
+        const j = await api.get<{ type: string; status: string; last_error: string | null }[]>(
+          '/api/jobs',
         );
         const hit = j.find((x) => x.type === running && x.status === 'running');
         if (!hit) {
@@ -132,26 +128,6 @@ export function SourceDetail() {
     }
   }
 
-  async function composeNow() {
-    if (!composeTopic.trim()) return;
-    setBusy('compose');
-    try {
-      await api.post('/api/compose', {
-        sourceId: Number(id),
-        topic: composeTopic.trim(),
-        angle: composeAngle.trim(),
-      });
-      toast('已生成草稿，去「草稿审核」查看');
-      setComposeOpen(false);
-      setComposeTopic('');
-      setComposeAngle('');
-      void load();
-    } catch (err) {
-      toast(err instanceof Error ? err.message : String(err), 'err');
-    } finally {
-      setBusy('');
-    }
-  }
 
   if (loading) return <Spinner />;
   if (!data) return <Empty>加载失败</Empty>;
@@ -168,11 +144,7 @@ export function SourceDetail() {
 
       <SectionTitle
         title={data.source.nickname ?? '未命名作者'}
-        desc={
-          <>
-            {data.source.profile_url} · 最近抓取 {data.source.last_scraped_at ?? '从未'}
-          </>
-        }
+        desc={`${data.source.profile_url} · 最近抓取 ${data.source.last_scraped_at ?? '从未'}`}
         action={
           <div className="flex gap-2">
             <button
@@ -182,81 +154,16 @@ export function SourceDetail() {
             >
               {busy === 'distill' ? '提交中…' : '蒸馏语料'}
             </button>
-            <button
-              className="btn-ghost"
-              disabled={busy === 'ideate' || running === 'ideate'}
-              onClick={() => void act('ideate', () => api.post(`/api/sources/${id}/ideate`), '选题已开始')}
-            >
-              {busy === 'ideate' ? '提交中…' : 'AI 选题'}
-            </button>
-            <button className="btn-primary" onClick={() => setComposeOpen((v) => !v)}>
-              立即创作
-            </button>
+            <Link to="/studio" className="btn-ghost">
+              去创作台 →
+            </Link>
           </div>
         }
       />
 
-      {composeOpen && (
-        <Card className="mb-5">
-          <label className="label">选题</label>
-          <input
-            className="input mb-3"
-            placeholder="例如：小户型厨房收纳的 5 个真实翻车点"
-            value={composeTopic}
-            onChange={(e) => setComposeTopic(e.target.value)}
-          />
-          <label className="label">切入角度（可选）</label>
-          <input
-            className="input"
-            placeholder="例如：从预算限制切入，强调真实感"
-            value={composeAngle}
-            onChange={(e) => setComposeAngle(e.target.value)}
-          />
-          <div className="flex gap-2 mt-4">
-            <button
-              className="btn-primary"
-              disabled={busy === 'compose' || !composeTopic.trim()}
-              onClick={() => void composeNow()}
-            >
-              {busy === 'compose' ? '生成中…（约 30-60 秒）' : '生成草稿'}
-            </button>
-            <button className="btn-ghost" onClick={() => setComposeOpen(false)}>
-              取消
-            </button>
-          </div>
-        </Card>
-      )}
-
-      {running && (
-        <div className="rounded-lg bg-violet-50 border border-violet-200 px-4 py-3 mb-4 text-sm text-violet-800 flex items-center gap-2">
-          <span className="w-3.5 h-3.5 border-2 border-violet-300 border-t-violet-600 rounded-full animate-spin" />
-          {running === 'distill'
-            ? '正在蒸馏语料…每篇都要调一次模型，篇数多的话需要几分钟'
-            : running === 'ideate'
-              ? '正在生成选题…'
-              : '处理中…'}
-          <button
-            className="ml-auto text-xs text-violet-600 hover:underline"
-            onClick={() => {
-              setRunning(null);
-              void load();
-            }}
-          >
-            不看了
-          </button>
-        </div>
-      )}
-
-      {hint && (
-        <div className="rounded-lg bg-amber-50 border border-amber-200 px-4 py-3 mb-4 text-sm text-amber-800">
-          {hint}
-        </div>
-      )}
-
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-5">
         <Stat label="笔记总数" value={data.stats.total} />
         <Stat label="已蒸馏" value={data.stats.styled} hint={data.stats.total ? `${Math.round((data.stats.styled / data.stats.total) * 100)}%` : ''} />
-        <Stat label="选题池" value={topics.filter((t) => t.status === 'open').length} />
         <Stat label="风格档案" value={p ? '已生成' : '未生成'} />
       </div>
 
@@ -353,49 +260,6 @@ export function SourceDetail() {
           </Empty>
         </Card>
       )}
-
-      {/* 选题池 */}
-      <Card className="mb-5">
-        <SectionTitle
-          title="选题池"
-          desc="待创作的选题，定时任务会从这里取"
-          action={
-            <div className="flex gap-2">
-              <input
-                className="input w-64"
-                placeholder="手动添加选题…"
-                value={newTopic}
-                onChange={(e) => setNewTopic(e.target.value)}
-                onKeyDown={async (e) => {
-                  if (e.key === 'Enter' && newTopic.trim()) {
-                    await api.post(`/api/sources/${id}/topics`, { title: newTopic.trim() });
-                    setNewTopic('');
-                    void load();
-                  }
-                }}
-              />
-            </div>
-          }
-        />
-        {topics.length === 0 ? (
-          <Empty>选题池为空。点右上「AI 选题」自动生成，或手动添加。</Empty>
-        ) : (
-          <div className="space-y-1.5">
-            {topics.slice(0, 20).map((t) => (
-              <div key={t.id} className="flex items-center gap-3 p-2 rounded-lg hover:bg-ink-50">
-                <span className="flex-1 min-w-0">
-                  <span className="text-sm text-ink-800">{t.title}</span>
-                  {t.angle && <span className="text-xs text-ink-400 ml-2">{t.angle}</span>}
-                </span>
-                {t.origin === 'ai' && <span className="badge bg-violet-100 text-violet-600">AI</span>}
-                <StatusBadge status={t.status} />
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
-
-      {/* 笔记列表 */}
       <Card>
         <SectionTitle title="原始语料" desc={`${data.notes.length} 篇笔记`} />
         {data.notes.length === 0 ? (

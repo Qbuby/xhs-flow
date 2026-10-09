@@ -1,5 +1,5 @@
 import { Cron } from 'croner';
-import { run, get, all, logEvent, recordRunLog } from '../db/index.js';
+import { run, get, all, logEvent, recordRunLog, getSetting } from '../db/index.js';
 import { logger } from '../logger.js';
 import { config } from '../config.js';
 import { scrapeAuthor } from '../xhs/scrape.js';
@@ -371,12 +371,37 @@ export function startScheduler(): void {
   reclaimOrphanJobs();
   setInterval(() => void tick(), 15_000).unref?.();
 
-  // 定时创作：为每个活跃源产一篇
-  scheduleCron('generate', config.schedule.generate, () => {
-    for (const sourceId of activeSourceIds()) {
-      enqueue('compose', { sourceId }, { dedupeKey: `compose:${sourceId}` });
-    }
-  });
+  // 定时创作：按设置来，不再写死在 .env
+  scheduleCron(
+    'generate',
+    (getSetting('schedule_generate') ?? config.schedule.generate) || '',
+    () => {
+      const autoCompose = (getSetting('auto_compose') ?? 'false') === 'true';
+      if (!autoCompose) {
+        logger.info('定时创作未开启，跳过');
+        return;
+      }
+
+      const perSource = Number(getSetting('compose_per_run') ?? '1');
+      const autoIdeate = (getSetting('auto_ideate') ?? 'true') === 'true';
+      const ideateCount = Number(getSetting('ideate_per_run') ?? '6');
+
+      for (const sourceId of activeSourceIds()) {
+        // 选题池空了就没东西可写 —— 先自动补一批选题，
+        // 否则这个定时任务每天都在空转
+        const open = get<{ c: number }>(
+          `SELECT COUNT(*) AS c FROM topics WHERE source_id = ? AND status = 'open'`,
+          sourceId,
+        );
+        if ((open?.c ?? 0) < perSource && autoIdeate) {
+          enqueue('ideate', { sourceId, count: ideateCount });
+        }
+        for (let i = 0; i < perSource; i++) {
+          enqueue('compose', { sourceId }, { dedupeKey: `compose:${sourceId}:${i}` });
+        }
+      }
+    },
+  );
 
   // 定时发布：只有开了自动发布才真正入队
   scheduleCron('publish', config.schedule.publish, () => {

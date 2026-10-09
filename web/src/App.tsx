@@ -2,6 +2,7 @@ import { NavLink, Route, Routes } from 'react-router-dom';
 import { useUi } from './store';
 import { Dashboard } from './pages/Dashboard';
 import { Sources } from './pages/Sources';
+import { Studio } from './pages/Studio';
 import { SourceDetail } from './pages/SourceDetail';
 import { Drafts } from './pages/Drafts';
 import { DraftDetail } from './pages/DraftDetail';
@@ -11,6 +12,7 @@ import { Settings } from './pages/Settings';
 const NAV = [
   { to: '/', label: '总览', end: true },
   { to: '/sources', label: '语料库' },
+  { to: '/studio', label: '创作台' },
   { to: '/drafts', label: '草稿审核' },
   { to: '/publish', label: '发布' },
   { to: '/settings', label: '设置' },
@@ -73,6 +75,7 @@ export function App() {
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/sources" element={<Sources />} />
+            <Route path="/studio" element={<Studio />} />
             <Route path="/sources/:id" element={<SourceDetail />} />
             <Route path="/drafts" element={<Drafts />} />
             <Route path="/drafts/:id" element={<DraftDetail />} />

@@ -230,8 +230,8 @@ export function Dashboard() {
             <button className="btn-ghost" onClick={() => void resetLogin()} title="清空本地登录态">
               退出登录
             </button>
-            <Link to="/sources" className="btn-primary">
-              去抓取
+            <Link to="/studio" className="btn-primary">
+              去创作
             </Link>
           </div>
         ) : health?.browser.unknown ? (
