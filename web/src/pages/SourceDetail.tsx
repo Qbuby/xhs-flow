@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router-dom';
 import { api, type NoteRow, type Topic, mediaUrl, fmtDate, fmtNum } from '../api';
 import { Card, SectionTitle, StatusBadge, Spinner, Empty, Stat } from '../components';
 import { toast } from '../store';
+import { partsToCron, describeNext } from '../util/schedule';
 
 interface Detail {
   source: {
@@ -10,7 +11,11 @@ interface Detail {
     nickname: string | null;
     profile_url: string;
     note_count: number;
+    available_count: number | null;
+    auto_scrape: number;
     last_scraped_at: string | null;
+    status: string;
+    last_error: string | null;
   };
   stats: { total: number; styled: number };
   notes: NoteRow[];
@@ -58,6 +63,11 @@ export function SourceDetail() {
   const [noteDetail, setNoteDetail] = useState<NoteDetail | null>(null);
   const [running, setRunning] = useState<string | null>(null);
   const [hint, setHint] = useState<string | null>(null);
+  const [batch, setBatch] = useState(30);
+  const [autoOn, setAutoOn] = useState(false);
+  const [reCron, setReCron] = useState('04:00');
+  const [reFreq, setReFreq] = useState<'daily' | 'weekly' | 'hourly'>('daily');
+  const [reDays, setReDays] = useState<number[]>([1, 2, 3, 4, 5, 6, 7]);
 
   async function load() {
     if (!id) return;
@@ -67,7 +77,7 @@ export function SourceDetail() {
         api.get<Topic[]>(`/api/sources/${id}/topics`),
       ]);
       setData(d);
-      setTopics(t);
+      setAutoOn(Boolean(d.source.auto_scrape));
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'err');
     } finally {
@@ -80,6 +90,39 @@ export function SourceDetail() {
     const t = setInterval(load, 12000);
     return () => clearInterval(t);
   }, [id]);
+
+  /** 续抓：只补没有的，已入库自动跳过 */
+  async function rescrape() {
+    setBusy('scrape');
+    setRunning('scrape');
+    try {
+      await api.post(`/api/sources/${id}/scrape`, { maxNotes: batch, downloadImages: true });
+      toast(`已开始补抓，目标新增 ${batch} 篇`);
+    } catch (err) {
+      const e = err as { message?: string; hint?: string };
+      toast(e.message ?? String(err), 'err');
+      if (e.hint) setHint(e.hint);
+      setRunning(null);
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function toggleAuto() {
+    const next = !autoOn;
+    try {
+      await api.post(`/api/sources/${id}/auto`, { enabled: next });
+      await api.post('/api/settings', {
+        scheduleRescrape: partsToCron({ time: reCron, freq: reFreq, days: reDays, everyNHours: 6 }),
+        rescrapeBatch: batch,
+      });
+      setAutoOn(next);
+      toast(next ? '已开启自动续抓' : '已关闭自动续抓');
+      void load();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), 'err');
+    }
+  }
 
   async function act(name: string, fn: () => Promise<unknown>, msg: string) {
     setBusy(name);
@@ -154,6 +197,13 @@ export function SourceDetail() {
             >
               {busy === 'distill' ? '提交中…' : '蒸馏语料'}
             </button>
+            <button
+              className="btn-primary"
+              disabled={busy === 'scrape' || running === 'scrape'}
+              onClick={() => void rescrape()}
+            >
+              {busy === 'scrape' || running === 'scrape' ? '抓取中…' : '继续抓取'}
+            </button>
             <Link to="/studio" className="btn-ghost">
               去创作台 →
             </Link>
@@ -166,6 +216,105 @@ export function SourceDetail() {
         <Stat label="已蒸馏" value={data.stats.styled} hint={data.stats.total ? `${Math.round((data.stats.styled / data.stats.total) * 100)}%` : ''} />
         <Stat label="风格档案" value={p ? '已生成' : '未生成'} />
       </div>
+
+      {/* 抓取 */}
+      <Card className="mb-5">
+        <SectionTitle
+          title="抓取"
+          desc={
+            data.source.available_count
+              ? `已入库 ${data.source.note_count} 篇 / 该作者可见 ${data.source.available_count} 篇`
+              : `已入库 ${data.source.note_count} 篇`
+          }
+        />
+
+        {running === 'scrape' && (
+          <div className="rounded-lg bg-violet-50 border border-violet-200 px-4 py-3 mb-4 text-sm text-violet-800 flex items-center gap-2">
+            <span className="w-3.5 h-3.5 border-2 border-violet-300 border-t-violet-600 rounded-full animate-spin" />
+            正在补抓新作品…只会存没有的，已有内容不会重复抓。
+            <button
+              className="ml-auto text-xs text-violet-600 hover:underline"
+              onClick={() => { setRunning(null); void load(); }}
+            >
+              不看了
+            </button>
+          </div>
+        )}
+
+        {data.source.status === 'error' && data.source.last_error && (
+          <div className="rounded-lg bg-rose-50 border border-rose-200 px-4 py-3 mb-4 text-sm text-rose-700">
+            <div className="font-medium mb-1">上次抓取失败</div>
+            <div className="text-xs leading-relaxed">{data.source.last_error}</div>
+          </div>
+        )}
+
+        <div className="flex flex-wrap items-end gap-3">
+          <div>
+            <label className="label">每次补抓多少篇</label>
+            <div className="flex gap-1.5">
+              {[20, 30, 50, 100].map((n) => (
+                <button
+                  key={n}
+                  onClick={() => setBatch(n)}
+                  className={`px-3 py-2 rounded-lg text-sm border transition-colors ${
+                    batch === n
+                      ? 'border-accent-400 bg-accent-500/10 text-accent-600 font-medium'
+                      : 'border-ink-200 text-ink-600 hover:bg-ink-50'
+                  }`}
+                >
+                  {n}
+                </button>
+              ))}
+            </div>
+          </div>
+          <button
+            className="btn-primary"
+            disabled={busy === 'scrape' || running === 'scrape'}
+            onClick={() => void rescrape()}
+          >
+            {running === 'scrape' ? '抓取中…' : `补抓 ${batch} 篇`}
+          </button>
+        </div>
+
+        <div className="mt-5 pt-4 border-t border-ink-100 flex flex-wrap items-center gap-3">
+          <div>
+            <div className="text-sm font-medium">自动续抓</div>
+            <div className="text-[11px] text-ink-500 mt-0.5">
+              定时自动补抓新作品，用来做日常增量同步
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <select
+              className="input w-28"
+              value={reFreq}
+              onChange={(e) => setReFreq(e.target.value as 'daily' | 'weekly' | 'hourly')}
+            >
+              <option value="daily">每天</option>
+              <option value="weekly">每周</option>
+              <option value="hourly">每隔几小时</option>
+            </select>
+            {reFreq === 'hourly' ? (
+              <span className="text-sm text-ink-500">（续抓建议每天一次即可）</span>
+            ) : (
+              <input
+                type="time"
+                className="input w-32"
+                value={reCron}
+                onChange={(e) => setReCron(e.target.value)}
+              />
+            )}
+          </div>
+          <button className={autoOn ? 'btn-primary' : 'btn-ghost'} onClick={() => void toggleAuto()}>
+            {autoOn ? '已开启' : '开启'}
+          </button>
+        </div>
+
+        {autoOn && (
+          <p className="text-[11px] text-ink-400 mt-2">
+            开启后每天会自动补抓 {batch} 篇。数量建议保守 —— 抓得太密容易触发小红书限流。
+          </p>
+        )}
+      </Card>
 
       {/* 风格画像 */}
       {p ? (

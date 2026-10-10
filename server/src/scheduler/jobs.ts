@@ -31,6 +31,7 @@ export interface JobPayload {
   sourceId?: number;
   profileUrl?: string;
   maxNotes?: number;
+  maxNew?: number;
   downloadImages?: boolean;
   count?: number;
   draftId?: number;
@@ -43,7 +44,13 @@ export interface JobPayload {
 
 export function enqueue(type: JobType, payload: JobPayload = {}, opts: { runAt?: string; dedupeKey?: string; maxAttempts?: number } = {}): number | null {
   if (opts.dedupeKey) {
-    const existing = get<{ id: number }>('SELECT id FROM jobs WHERE dedupe_key = ?', opts.dedupeKey);
+    // 只对「还在排队/执行中」的任务去重。
+    // 之前不看状态，导致手动续抓这种要反复触发的任务被一次历史记录永久挡死 ——
+    // 点了没反应，还以为抓过了。
+    const existing = get<{ id: number }>(
+      "SELECT id FROM jobs WHERE dedupe_key = ? AND status IN ('pending','running')",
+      opts.dedupeKey,
+    );
     if (existing) return existing.id;
   }
   const r = run(
@@ -69,6 +76,7 @@ const handlers: Record<JobType, Handler> = {
     const res = await scrapeAuthor({
       profileUrl: p.profileUrl,
       maxNotes: p.maxNotes ?? 200,
+      maxNew: p.maxNew,
       downloadImages: p.downloadImages ?? true,
     });
     // 抓完自动排队蒸馏，省得手动点
@@ -249,7 +257,7 @@ async function execute(job: { id: number; type: JobType; payload: JobPayload }):
     const result = await handler(job.payload, job.id);
     const ms = Date.now() - started;
     run(
-      "UPDATE jobs SET status='done', finished_at=datetime('now'), last_error=NULL WHERE id=?",
+      "UPDATE jobs SET status='done', finished_at=datetime('now'), last_error=NULL, dedupe_key=NULL WHERE id=?",
       job.id,
     );
     recordRunLog('info', job.type, `任务完成（${ms}ms）`, result);
@@ -265,7 +273,7 @@ async function execute(job: { id: number; type: JobType; payload: JobPayload }):
 
     if (exhausted || hopeless) {
       run(
-        `UPDATE jobs SET status='failed', last_error=?, finished_at=datetime('now') WHERE id=?`,
+        `UPDATE jobs SET status='failed', last_error=?, finished_at=datetime('now'), dedupe_key=NULL WHERE id=?`,
         message,
         job.id,
       );
@@ -297,6 +305,11 @@ async function execute(job: { id: number; type: JobType; payload: JobPayload }):
  * 它们永远不会再被 claim，也永远不会结束。启动时统一回收。
  */
 function reclaimOrphanJobs(): number {
+  // 历史遗留：早期版本完成后不清 dedupe_key，会把后续同 key 任务永久挡住
+  run(
+    "UPDATE jobs SET dedupe_key = NULL WHERE status IN ('done','failed','canceled') AND dedupe_key IS NOT NULL",
+  );
+
   const orphans = all<{ id: number }>(`SELECT id FROM jobs WHERE status = 'running'`);
   if (orphans.length === 0) return 0;
   for (const o of orphans) {
@@ -307,7 +320,7 @@ function reclaimOrphanJobs(): number {
     const exhausted = (row?.attempts ?? 0) >= (row?.max_attempts ?? 3);
     if (exhausted) {
       run(
-        `UPDATE jobs SET status='failed', last_error='进程异常退出，任务未完成', finished_at=datetime('now') WHERE id=?`,
+        `UPDATE jobs SET status='failed', last_error='进程异常退出，任务未完成', finished_at=datetime('now'), dedupe_key=NULL WHERE id=?`,
         o.id,
       );
     } else {
@@ -404,6 +417,31 @@ export function startScheduler(): void {
   );
 
   // 定时发布：只有开了自动发布才真正入队
+  // 自动续抓：到点给开了开关的语料源补新作品
+  scheduleCron(
+    'rescrape',
+    getSetting('schedule_rescrape') || '0 4 * * *',
+    () => {
+      const batch = Number(getSetting('rescrape_batch') ?? '30');
+      const rows = all<{ id: number; profile_url: string; note_count: number }>(
+        `SELECT id, profile_url, note_count FROM sources
+         WHERE auto_scrape = 1 AND status = 'active'`,
+      );
+      if (rows.length === 0) {
+        logger.info('没有开启自动续抓的语料源');
+        return;
+      }
+      for (const r of rows) {
+        enqueue(
+          'scrape',
+          { profileUrl: r.profile_url, maxNotes: 1000, maxNew: batch, downloadImages: true },
+          { dedupeKey: `scrape:${r.id}` },
+        );
+      }
+      logger.info({ count: rows.length, batch }, '已排入自动续抓');
+    },
+  );
+
   scheduleCron('publish', config.schedule.publish, () => {
     if (!config.publish.auto) {
       logger.info('自动发布未开启，跳过');

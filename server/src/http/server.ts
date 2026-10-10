@@ -36,9 +36,10 @@ import { llmHealth, llmInfo } from '../llm/client.js';
 import { activeProviders } from '../media/stock.js';
 
 /** 把 cron 表达式翻译成「下一次会是什么时候」，创作台要显示。 */
-function nextRunTimes(): { generate: string | null; publish: string | null } {
+function nextRunTimes(): { generate: string | null; publish: string | null; rescrape: string | null } {
   const gen = getSetting('schedule_generate') ?? config.schedule.generate;
   const pub = getSetting('schedule_publish') ?? config.schedule.publish;
+  const re = getSetting('schedule_rescrape') ?? '0 4 * * *';
   const calc = (p: string): string | null => {
     if (!p?.trim()) return null;
     try {
@@ -50,7 +51,7 @@ function nextRunTimes(): { generate: string | null; publish: string | null } {
       return null;
     }
   };
-  return { generate: calc(gen), publish: calc(pub) };
+  return { generate: calc(gen), publish: calc(pub), rescrape: calc(re) };
 }
 
 export async function buildServer() {
@@ -101,6 +102,8 @@ export async function buildServer() {
       autoIdeate: (getSetting('auto_ideate') ?? 'true') === 'true',
       composePerRun: Number(getSetting('compose_per_run') ?? '1'),
       ideatePerRun: Number(getSetting('ideate_per_run') ?? '6'),
+      rescrape: getSetting('schedule_rescrape') ?? '0 4 * * *',
+      rescrapeBatch: Number(getSetting('rescrape_batch') ?? '30'),
     },
     nextRun: nextRunTimes(),
   }));
@@ -118,14 +121,22 @@ export async function buildServer() {
     setStr('auto_ideate', body.autoIdeate);
     setStr('compose_per_run', body.composePerRun);
     setStr('ideate_per_run', body.ideatePerRun);
+    setStr('schedule_rescrape', body.rescrape);
+    setStr('rescrape_batch', body.rescrapeBatch);
 
     // cron 表达式校验：无效的表达式不该等到下次触发才暴露
-    if (typeof body.scheduleGenerate === 'string' && body.scheduleGenerate.trim()) {
-      try {
-        new Cron(body.scheduleGenerate);
-      } catch {
-        reply.code(400);
-        return { error: `定时创作表达式无效：${body.scheduleGenerate}` };
+    for (const [key, label] of [
+      ['scheduleGenerate', '定时创作'],
+      ['scheduleRescrape', '自动续抓'],
+    ] as const) {
+      const v = body[key];
+      if (typeof v === 'string' && v.trim()) {
+        try {
+          new Cron(v);
+        } catch {
+          reply.code(400);
+          return { error: `${label}的时间表达式无效：${v}` };
+        }
       }
     }
     return { ok: true, nextRun: nextRunTimes() };
@@ -294,6 +305,51 @@ export async function buildServer() {
   });
 
   /* ---------------- 语料操作 ---------------- */
+
+  /**
+   * 续抓：只补没有的，已入库的自动跳过。
+   * `maxNotes` 传 null 表示「一次抓到作者全部作品」；
+   * 数字则表示「本次最多新增这么多篇」，避免一次拉太多触发风控。
+   */
+  app.post('/api/sources/:id/scrape', async (req) => {
+    const id = Number((req.params as { id: string }).id);
+    const body = (req.body ?? {}) as { maxNotes?: number | null; downloadImages?: boolean };
+    const src = get<{ profile_url: string; note_count: number }>(
+      'SELECT profile_url, note_count FROM sources WHERE id = ?',
+      id,
+    );
+    if (!src) return { error: '语料源不存在' };
+
+    // maxNotes = 本次要**新增**多少篇（不是总共处理多少条）。
+    // 列表阶段单独给足覆盖量，否则会把作者几百篇旧作翻个遍才凑够数。
+    const maxNew = body.maxNotes === null || body.maxNotes === undefined ? 2000 : Number(body.maxNotes);
+    const avail = get<{ c: number }>(
+      'SELECT available_count AS c FROM sources WHERE id = ?',
+      id,
+    );
+    const listed = Math.max(avail?.c ?? 0, src.note_count + 1) + 200;
+
+    return {
+      ok: true,
+      jobId: enqueue(
+        'scrape',
+        { profileUrl: src.profile_url, maxNotes: listed, maxNew, downloadImages: body.downloadImages ?? true },
+        { dedupeKey: `scrape:${id}` },
+      ),
+    };
+  });
+
+  /** 单个语料源的自动续抓开关 */
+  app.post('/api/sources/:id/auto', async (req) => {
+    const id = Number((req.params as { id: string }).id);
+    const { enabled } = (req.body ?? {}) as { enabled?: boolean };
+    run(
+      "UPDATE sources SET auto_scrape = ?, updated_at = datetime('now') WHERE id = ?",
+      enabled ? 1 : 0,
+      id,
+    );
+    return { ok: true, enabled: Boolean(enabled) };
+  });
 
   app.post('/api/sources/:id/distill', async (req, reply) => {
     const id = Number((req.params as { id: string }).id);

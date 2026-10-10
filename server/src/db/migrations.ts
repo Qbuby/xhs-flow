@@ -214,4 +214,12 @@ export const MIGRATIONS: string[] = [
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
   `,
+
+  /* ---------- 增量续抓 ---------- */
+  // 用 ALTER 而不是 CREATE：已存在的库需要补列。
+  // 新建库时这两句会因「列已存在」报错，所以先探测再改。
+  `
+  ALTER TABLE sources ADD COLUMN available_count INTEGER;
+  ALTER TABLE sources ADD COLUMN auto_scrape INTEGER NOT NULL DEFAULT 0;
+  `,
 ];

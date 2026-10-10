@@ -69,6 +69,8 @@ export interface Source {
   last_error: string | null;
   last_scraped_at: string | null;
   styled: number;
+  available_count: number | null;
+  auto_scrape: number;
 }
 
 export interface NoteRow {

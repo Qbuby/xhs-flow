@@ -440,7 +440,10 @@ function indexNoteFts(notePk: number, title: string, desc: string, tags: string[
 
 export interface ScrapeOptions {
   profileUrl: string;
+  /** 列表阶段最多收集多少条（覆盖全部作品时给足） */
   maxNotes?: number;
+  /** 本次最多**新增**多少篇。默认不限。 */
+  maxNew?: number;
   downloadImages?: boolean;
   onProgress?: ProgressFn;
   signal?: AbortSignal;
@@ -455,7 +458,7 @@ export interface ScrapeResult {
 }
 
 export async function scrapeAuthor(opts: ScrapeOptions): Promise<ScrapeResult> {
-  const { profileUrl, maxNotes = 200, downloadImages = true, onProgress = () => {}, signal } = opts;
+  const { profileUrl, maxNotes = 200, maxNew = Infinity, downloadImages = true, onProgress = () => {}, signal } = opts;
 
   const sourceId = upsertSource(profileUrl, { status: 'scraping' });
   const { userId: urlUserId, xsecToken } = parseProfileUrl(profileUrl);
@@ -502,10 +505,15 @@ export async function scrapeAuthor(opts: ScrapeOptions): Promise<ScrapeResult> {
   const attempts: string[] = [];
 
   try {
-    const harvested = await harvestNoteList(userId, maxNotes, (n) =>
-      onProgress({ phase: 'list', done: n, total: maxNotes }),
+    // 这次列出的条数就是「当前能看到的作品数」，记下来界面就能显示还差多少
+    const harvestCap = Math.max(maxNotes, (get<{ c: number }>(
+      'SELECT COUNT(*) AS c FROM notes WHERE source_id = ?', sourceId,
+    )?.c ?? 0) + 200);
+    const harvested = await harvestNoteList(userId, harvestCap, (n) =>
+      onProgress({ phase: 'list', done: n, total: harvestCap }),
     );
     listed = harvested.map((h) => ({ noteId: h.noteId, xsecToken: h.xsecToken }));
+    run('UPDATE sources SET available_count = ? WHERE id = ?', harvested.length, sourceId);
     usedVia.push('browser:harvest');
 
     // 作者资料也从页面响应里顺带采一份 —— 直接调 API 那条路会被签名拒掉
@@ -592,6 +600,11 @@ export async function scrapeAuthor(opts: ScrapeOptions): Promise<ScrapeResult> {
 
   for (const [i, item] of target.entries()) {
     if (signal?.aborted) break;
+    // 续抓：够数就收工，不用把作者几百篇全翻一遍
+    if (stored >= maxNew) {
+      logger.info({ sourceId, stored, maxNew }, '已达到本次新增上限，提前结束');
+      break;
+    }
 
     const already = get<{ id: number }>(
       'SELECT id FROM notes WHERE source_id = ? AND note_id = ?',

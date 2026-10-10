@@ -16,7 +16,16 @@ db.exec('PRAGMA busy_timeout = 5000');
 
 // 迁移按顺序执行；用户自定义表都已用 IF NOT EXISTS，重跑是幂等的。
 for (const sql of MIGRATIONS) {
-  db.exec(sql);
+  try {
+    db.exec(sql);
+  } catch (err) {
+    // ALTER TABLE ADD COLUMN 在列已存在时会报错，这属于「已经迁移过了」，
+    // 不该让整个服务起不来。
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/duplicate column name|already exists/i.test(msg)) {
+      console.warn('[db] 迁移失败:', msg.slice(0, 120));
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */
