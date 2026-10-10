@@ -68,13 +68,12 @@ npm run typecheck
 
 ### 文本模型
 
-**baseURL 和 apiKey 必须成对**，因为智谱的团队套餐 key 和按量付费 key 不通用，指向的地址也不同：
+在 **设置 → 模型配置** 页面直接改，保存即生效，不用重启：
 
-| profile | baseURL | 适用 |
-|---|---|---|
-| `glm-coding` | `https://open.bigmodel.cn/api/coding/paas/v4` | 团队套餐 key |
-| `glm-paygpt` | `https://open.bigmodel.cn/api/paas/v4` | 按量付费 key |
-| `openai` | `https://api.openai.com/v1` | OpenAI |
+- **API 格式**：Anthropic Messages（/v1/messages）或 OpenAI Chat Completions
+- **Base URL / 模型名 / API Key**：按供应商给什么填什么
+- 配置存本地数据库；`.env` 里的值只是首次运行的默认值
+- API Key 在界面上只显示掩码（`sk-1H…WAzu`），留空保存表示不修改
 
 ### 图库（可选）
 

@@ -5,6 +5,14 @@ import { toast } from '../store';
 
 interface Settings {
   brand: string;
+  llm: {
+    api: 'openai' | 'anthropic';
+    baseURL: string;
+    model: string;
+    hasKey: boolean;
+    keyMasked: string;
+    fromEnv: boolean;
+  };
   schedule: { generate: string; publish: string; autoPublish: boolean };
 }
 
@@ -17,7 +25,14 @@ export function Settings() {
   const [generate, setGenerate] = useState('');
   const [publish, setPublish] = useState('');
   const [checking, setChecking] = useState('');
+  const [busy, setBusy] = useState('');
   const [result, setResult] = useState<string>('');
+  const [llmApi, setLlmApi] = useState<'openai' | 'anthropic'>('anthropic');
+  const [llmBase, setLlmBase] = useState('');
+  const [llmModel, setLlmModel] = useState('');
+  const [llmKey, setLlmKey] = useState('');
+  const [keyMasked, setKeyMasked] = useState('');
+  const [fromEnv, setFromEnv] = useState(false);
 
   async function load() {
     try {
@@ -34,6 +49,13 @@ export function Settings() {
       setHealth(h);
       setEvents(e);
       setJobs(j);
+      if (s.llm) {
+        setLlmApi(s.llm.api);
+        setLlmBase(s.llm.baseURL);
+        setLlmModel(s.llm.model);
+        setKeyMasked(s.llm.keyMasked);
+        setFromEnv(s.llm.fromEnv);
+      }
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'err');
     }
@@ -59,9 +81,31 @@ export function Settings() {
     }
   }
 
+  async function saveLlm() {
+    setBusy('llm');
+    try {
+      await api.post('/api/settings', {
+        llmApi,
+        llmBaseUrl: llmBase,
+        llmModel,
+        ...(llmKey.trim() ? { llmApiKey: llmKey.trim() } : {}),
+      });
+      toast('模型配置已保存，立即生效');
+      setLlmKey('');
+      void load();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), 'err');
+    } finally {
+      setBusy('');
+    }
+  }
+
   async function check(what: 'cookie' | 'llm') {
     setChecking(what);
     setResult('');
+    if (what === 'llm' && busy !== 'llm') {
+      await saveLlm();
+    }
     try {
       const res = await api.post<{
         cookie: { ok: boolean; detail: string };
@@ -128,6 +172,69 @@ export function Settings() {
           <button className="btn-primary" onClick={() => void save()}>
             保存
           </button>
+        </Card>
+
+        <Card>
+          <SectionTitle
+            title="模型配置"
+            desc="存本地数据库，保存即生效，不用重启服务"
+          />
+
+          <label className="label">API 格式</label>
+          <select
+            className="input mb-1"
+            value={llmApi}
+            onChange={(e) => setLlmApi(e.target.value as 'openai' | 'anthropic')}
+          >
+            <option value="anthropic">Anthropic Messages（/v1/messages）</option>
+            <option value="openai">OpenAI Chat Completions（/chat/completions）</option>
+          </select>
+          <div className="text-[11px] text-ink-400 mb-3">
+            按供应商给的格式选。智谱 / MiniMax 官方是 OpenAI 格式；中转站两种都可能，看它面板上写哪个。
+          </div>
+
+          <label className="label">Base URL</label>
+          <input
+            className="input mb-3 font-mono text-xs"
+            placeholder="https://api.example.com"
+            value={llmBase}
+            onChange={(e) => setLlmBase(e.target.value)}
+          />
+
+          <label className="label">模型名</label>
+          <input
+            className="input mb-3 font-mono text-xs"
+            placeholder="例如 glm-5.3 / MiniMax-M3.1-Flash-Preview"
+            value={llmModel}
+            onChange={(e) => setLlmModel(e.target.value)}
+          />
+
+          <label className="label">API Key</label>
+          <input
+            type="password"
+            className="input mb-1 font-mono text-xs"
+            placeholder={keyMasked ? `已配置（${keyMasked}），留空则不修改` : '尚未配置'}
+            value={llmKey}
+            onChange={(e) => setLlmKey(e.target.value)}
+            autoComplete="off"
+          />
+          <div className="text-[11px] text-ink-400 mb-4">
+            {fromEnv
+              ? '当前 key 来自 .env，在这里填入新值即可覆盖'
+              : '留空表示保持现有 key 不变'}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button className="btn-primary" disabled={busy === 'llm'} onClick={() => void saveLlm()}>
+              {busy === 'llm' ? '保存中…' : '保存模型配置'}
+            </button>
+            <button className="btn-ghost" disabled={checking === 'llm'} onClick={() => void check('llm')}>
+              {checking === 'llm' ? '检测中…' : '保存并检测连通'}
+            </button>
+          </div>
+          {result && (
+            <div className="text-xs bg-ink-50 p-2.5 rounded-lg mt-3 break-words">{result}</div>
+          )}
         </Card>
 
         <Card>

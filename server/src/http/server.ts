@@ -10,8 +10,7 @@ import {
   WEB_DIST,
   describeMissingConfig,
   MEDIA_DIR,
-  PROFILE_DIR,
-  llmIsConfigured,
+  PROFILE_DIR
 } from '../config.js';
 import { logger } from '../logger.js';
 import {
@@ -33,6 +32,12 @@ import { DEFAULT_SPEC, renderCard } from '../generate/cards.js';
 import { enqueue, schedulerInfo, runNow } from '../scheduler/jobs.js';
 import { approvedDrafts } from '../xhs/publish.js';
 import { llmHealth, llmInfo } from '../llm/client.js';
+import {
+  getLlmConfig,
+  llmIsConfigured,
+  describeLlmMissing,
+  maskKey,
+} from '../llm/runtime.js';
 import { activeProviders } from '../media/stock.js';
 
 /** 把 cron 表达式翻译成「下一次会是什么时候」，创作台要显示。 */
@@ -73,7 +78,7 @@ export async function buildServer() {
       ok: true,
       llm: llmInfo(),
       llmConfigured: llmIsConfigured(),
-      llmMissing: describeMissingConfig(),
+      llmMissing: describeLlmMissing(),
       stockProviders: activeProviders().map((p) => ({
         name: p.name,
         keyless: p.keyless,
@@ -91,8 +96,18 @@ export async function buildServer() {
     };
   });
 
-  app.get('/api/settings', async () => ({
+  app.get('/api/settings', async () => {
+    const llm = getLlmConfig();
+    return {
     brand: getSetting('brand') ?? '',
+    llm: {
+      api: llm.api,
+      baseURL: llm.baseURL,
+      model: llm.model,
+      hasKey: Boolean(llm.apiKey),
+      keyMasked: maskKey(llm.apiKey),
+      fromEnv: !getSetting('llm_api_key'),
+    },
     schedule: {
       generate: getSetting('schedule_generate') ?? config.schedule.generate,
       publish: getSetting('schedule_publish') ?? config.schedule.publish,
@@ -106,7 +121,8 @@ export async function buildServer() {
       rescrapeBatch: Number(getSetting('rescrape_batch') ?? '30'),
     },
     nextRun: nextRunTimes(),
-  }));
+    };
+  });
 
   app.post('/api/settings', async (req, reply) => {
     const body = (req.body ?? {}) as Record<string, string | number | boolean>;
@@ -123,6 +139,14 @@ export async function buildServer() {
     setStr('ideate_per_run', body.ideatePerRun);
     setStr('schedule_rescrape', body.rescrape);
     setStr('rescrape_batch', body.rescrapeBatch);
+    // 模型配置。key 只在非空时更新 —— 界面上留空表示「保持现状」，
+    // 不然掩码显示的占位符一保存就把真 key 冲掉了。
+    setStr('llm_api', typeof body.llmApi === 'string' && ['openai','anthropic'].includes(body.llmApi) ? body.llmApi : undefined);
+    setStr('llm_base_url', typeof body.llmBaseUrl === 'string' ? body.llmBaseUrl.trim() : undefined);
+    setStr('llm_model', typeof body.llmModel === 'string' ? body.llmModel.trim() : undefined);
+    if (typeof body.llmApiKey === 'string' && body.llmApiKey.trim()) {
+      setSetting('llm_api_key', body.llmApiKey.trim());
+    }
 
     // cron 表达式校验：无效的表达式不该等到下次触发才暴露
     for (const [key, label] of [

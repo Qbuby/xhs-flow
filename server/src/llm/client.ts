@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import { config } from '../config.js';
+import { getLlmConfig } from './runtime.js';
 import { logger } from '../logger.js';
 import { recordRunLog } from '../db/index.js';
 import { extractJson } from '../util/text.js';
@@ -20,14 +20,10 @@ import { extractJson } from '../util/text.js';
 let openaiClient: OpenAI | null = null;
 let openaiKey = '';
 
-function getOpenAI(): OpenAI {
-  const sig = `${config.llm.baseURL}|${config.llm.apiKey}`;
+function getOpenAI(baseURL: string, apiKey: string): OpenAI {
+  const sig = `${baseURL}|${apiKey}`;
   if (openaiClient && openaiKey === sig) return openaiClient;
-  openaiClient = new OpenAI({
-    baseURL: config.llm.baseURL,
-    apiKey: config.llm.apiKey,
-    maxRetries: 2,
-  });
+  openaiClient = new OpenAI({ baseURL, apiKey, maxRetries: 2 });
   openaiKey = sig;
   return openaiClient;
 }
@@ -50,11 +46,12 @@ interface AnthropicResponse {
 }
 
 async function callAnthropic(opts: ChatOptions, maxTokens: number): Promise<AnthropicResponse> {
-  const base = config.llm.baseURL.replace(/\/+$/, '');
+  const cfg = getLlmConfig();
+  const base = cfg.baseURL.replace(/\/+$/, '');
   const url = base.endsWith('/v1/messages') ? base : `${base}/v1/messages`;
 
   const body = {
-    model: config.llm.model,
+    model: cfg.model,
     max_tokens: maxTokens,
     // Anthropic 的 system 是顶层字段，不放进 messages
     ...(opts.system ? { system: opts.system } : {}),
@@ -67,7 +64,7 @@ async function callAnthropic(opts: ChatOptions, maxTokens: number): Promise<Anth
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-api-key': config.llm.apiKey,
+      'x-api-key': cfg.apiKey,
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify(body),
@@ -124,12 +121,13 @@ async function chatAnthropic(opts: ChatOptions): Promise<string> {
 /* ------------------------------------------------------------------ */
 
 async function chatOpenAI(opts: ChatOptions): Promise<string> {
+  const cfg = getLlmConfig();
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
   if (opts.system) messages.push({ role: 'system', content: opts.system });
   messages.push({ role: 'user', content: opts.user });
 
-  const res = await getOpenAI().chat.completions.create({
-    model: config.llm.model,
+  const res = await getOpenAI(cfg.baseURL, cfg.apiKey).chat.completions.create({
+    model: cfg.model,
     messages,
     temperature: opts.temperature ?? 0.8,
     max_completion_tokens: opts.maxTokens ?? 4096,
@@ -144,10 +142,11 @@ async function chatOpenAI(opts: ChatOptions): Promise<string> {
 /* ------------------------------------------------------------------ */
 
 export async function chat(opts: ChatOptions): Promise<string> {
-  if (!config.llm.apiKey) {
-    throw new Error('未配置模型 key（.env 里的 XHSFLOW_LLM_API_KEY）');
+  const cfg = getLlmConfig();
+  if (!cfg.apiKey) {
+    throw new Error('未配置模型 API Key —— 到「设置 → 模型配置」里填');
   }
-  return config.llm.api === 'anthropic' ? chatAnthropic(opts) : chatOpenAI(opts);
+  return cfg.api === 'anthropic' ? chatAnthropic(opts) : chatOpenAI(opts);
 }
 
 /**
@@ -161,7 +160,7 @@ export async function chatJson<T>(opts: ChatOptions): Promise<T> {
     ? `${opts.system ? opts.system + '\n\n' : ''}【输出格式】只输出一个 JSON 对象，不要任何解释、前言或代码块围栏。`
     : opts.system;
 
-  const raw = await chat({ ...opts, system, jsonMode: config.llm.api === 'openai' && wantsJson });
+  const raw = await chat({ ...opts, system, jsonMode: getLlmConfig().api === 'openai' && wantsJson });
 
   try {
     return extractJson<T>(raw);
@@ -191,10 +190,11 @@ function friendlyError(raw: string): string {
 
 /** 探活，设置页用。 */
 export async function llmHealth(): Promise<{ ok: boolean; detail: string }> {
-  if (!config.llm.apiKey) return { ok: false, detail: '未配置 key' };
+  const cfg = getLlmConfig();
+  if (!cfg.apiKey) return { ok: false, detail: '未配置 API Key（设置 → 模型配置）' };
   try {
     const out = await chat({ user: '回复两个字：正常', maxTokens: 2048, temperature: 0 });
-    return { ok: true, detail: `${config.llm.model} 响应：${out.trim().slice(0, 40)}` };
+    return { ok: true, detail: `${cfg.model} 响应：${out.trim().slice(0, 40)}` };
   } catch (err) {
     const raw = err instanceof Error ? err.message : String(err);
     return { ok: false, detail: friendlyError(raw) };
@@ -202,11 +202,11 @@ export async function llmHealth(): Promise<{ ok: boolean; detail: string }> {
 }
 
 export function llmInfo() {
+  const cfg = getLlmConfig();
   return {
-    api: config.llm.api,
-    profile: config.llm.profile,
-    baseURL: config.llm.baseURL,
-    model: config.llm.model,
-    hasKey: Boolean(config.llm.apiKey),
+    api: cfg.api,
+    baseURL: cfg.baseURL,
+    model: cfg.model,
+    hasKey: Boolean(cfg.apiKey),
   };
 }
