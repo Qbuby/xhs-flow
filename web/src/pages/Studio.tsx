@@ -3,6 +3,14 @@ import { Link } from 'react-router-dom';
 import { api } from '../api';
 import { Card, SectionTitle, StatusBadge, Spinner, Empty, Dot } from '../components';
 import { toast } from '../store';
+import {
+  cronToParts,
+  partsToCron,
+  describeSchedule,
+  describeNext,
+  type ScheduleParts,
+  type Frequency,
+} from '../util/schedule';
 
 interface Source {
   id: number;
@@ -41,18 +49,6 @@ interface Settings {
   nextRun?: { generate: string | null; publish: string | null };
 }
 
-function fmtNext(iso: string | null): string {
-  if (!iso) return '未排期';
-  const d = new Date(iso);
-  const now = new Date();
-  const diff = d.getTime() - now.getTime();
-  if (diff < 0) return '即将执行';
-  const h = Math.floor(diff / 3_600_000);
-  const m = Math.round((diff % 3_600_000) / 60_000);
-  const rel = h > 0 ? `${h} 小时 ${m} 分后` : `${m} 分钟后`;
-  return `${d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}（${rel}）`;
-}
-
 export function Studio() {
   const [studio, setStudio] = useState<Studio | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -65,7 +61,7 @@ export function Studio() {
   const [angle, setAngle] = useState('');
   const [newTopic, setNewTopic] = useState('');
 
-  const [cron, setCron] = useState('');
+  const [parts, setParts] = useState<ScheduleParts>(cronToParts('30 9 * * *'));
   const [autoCompose, setAutoCompose] = useState(false);
   const [autoIdeate, setAutoIdeate] = useState(true);
   const [perRun, setPerRun] = useState(1);
@@ -80,7 +76,7 @@ export function Studio() {
       ]);
       setStudio(st);
       setSettings(se);
-      setCron(se.schedule.generate);
+      setParts(cronToParts(se.schedule.generate));
       setAutoCompose(Boolean(se.schedule.autoCompose));
       setAutoIdeate(se.schedule.autoIdeate !== false);
       setPerRun(se.schedule.composePerRun ?? 1);
@@ -105,7 +101,7 @@ export function Studio() {
     try {
       await api.post('/api/settings', {
         brand,
-        scheduleGenerate: cron,
+        scheduleGenerate: partsToCron(parts),
         autoCompose,
         autoIdeate,
         composePerRun: perRun,
@@ -243,16 +239,73 @@ export function Studio() {
 
         <div className="grid md:grid-cols-2 gap-4 py-4 border-b border-ink-100">
           <div>
-            <label className="label">执行时间（crontab）</label>
-            <input
-              className="input font-mono"
-              value={cron}
-              onChange={(e) => setCron(e.target.value)}
-              placeholder="30 9 * * *"
-            />
-            <div className="text-[11px] text-ink-400 mt-1">
-              下次运行：{fmtNext(settings?.nextRun?.generate ?? null)}
+            <label className="label">什么时候跑</label>
+            <div className="flex flex-wrap items-center gap-2">
+              <select
+                className="input w-32"
+                value={parts.freq}
+                onChange={(e) => setParts({ ...parts, freq: e.target.value as Frequency })}
+              >
+                <option value="daily">每天</option>
+                <option value="weekly">每周</option>
+                <option value="hourly">每隔几小时</option>
+              </select>
+
+              {parts.freq === 'hourly' ? (
+                <div className="flex items-center gap-1.5">
+                  <span className="text-sm text-ink-500">每</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={23}
+                    className="input w-20"
+                    value={parts.everyNHours}
+                    onChange={(e) => setParts({ ...parts, everyNHours: Number(e.target.value) })}
+                  />
+                  <span className="text-sm text-ink-500">小时</span>
+                </div>
+              ) : (
+                <input
+                  type="time"
+                  className="input w-32"
+                  value={parts.time}
+                  onChange={(e) => setParts({ ...parts, time: e.target.value })}
+                />
+              )}
             </div>
+
+            {parts.freq === 'weekly' && (
+              <div className="flex gap-1 mt-2">
+                {[1, 2, 3, 4, 5, 6, 7].map((d) => (
+                  <button
+                    key={d}
+                    onClick={() =>
+                      setParts({
+                        ...parts,
+                        days: parts.days.includes(d)
+                          ? parts.days.filter((x) => x !== d)
+                          : [...parts.days, d].sort(),
+                      })
+                    }
+                    className={`w-8 h-8 rounded-lg text-xs font-medium transition-colors ${
+                      parts.days.includes(d)
+                        ? 'bg-accent-500 text-white'
+                        : 'bg-ink-100 text-ink-500 hover:bg-ink-200'
+                    }`}
+                  >
+                    {['一', '二', '三', '四', '五', '六', '日'][d - 1]}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <div className="text-[11px] text-ink-500 mt-2">
+              {describeSchedule(parts)} · 下次：{describeNext(settings?.nextRun?.generate ?? null)}
+            </div>
+            <details className="text-[11px] text-ink-400 mt-1">
+              <summary className="cursor-pointer select-none">crontab 原始表达式</summary>
+              <code className="bg-ink-100 px-1.5 py-0.5 rounded ml-1">{partsToCron(parts)}</code>
+            </details>
           </div>
           <div>
             <label className="label">每次产几篇</label>

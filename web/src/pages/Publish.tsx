@@ -2,13 +2,21 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, type Draft } from '../api';
 import { Card, SectionTitle, Spinner, Empty } from '../components';
+
+interface Settings {
+  brand: string;
+  schedule: { generate: string; publish: string; autoPublish: boolean };
+  nextRun?: { generate: string | null; publish: string | null };
+}
 import { toast } from '../store';
+import { cronToParts, partsToCron, describeSchedule, describeNext } from '../util/schedule';
 
 export function Publish() {
   const [queue, setQueue] = useState<Draft[]>([]);
   const [running, setRunning] = useState(false);
   const [auto, setAuto] = useState(false);
-  const [schedule, setSchedule] = useState('');
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [parts, setParts] = useState(() => cronToParts('0 */2 * * *'));
 
   async function load() {
     try {
@@ -18,7 +26,7 @@ export function Publish() {
       ]);
       setQueue(d);
       setAuto(s.schedule.autoPublish);
-      setSchedule(s.schedule.publish);
+      setParts(cronToParts(s.schedule.publish));
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'err');
     }
@@ -48,7 +56,7 @@ export function Publish() {
   async function toggleAuto() {
     const next = !auto;
     try {
-      await api.post('/api/settings', { autoPublish: next });
+      await api.post('/api/settings', { autoPublish: next, schedulePublish: partsToCron(parts) });
       setAuto(next);
       toast(next ? '已开启自动发布' : '已关闭自动发布');
     } catch (err) {
@@ -72,7 +80,8 @@ export function Publish() {
         <div>
           <div className="text-sm font-medium">自动发布</div>
           <div className="text-xs text-ink-500 mt-0.5">
-            定时任务 <code className="bg-ink-100 px-1 rounded">{schedule || '0 */2 * * *'}</code> 自动发布已通过的草稿。
+            {describeSchedule(parts)} 自动发布已通过的草稿
+            （下次 {describeNext(settings?.nextRun?.publish ?? null)}）。
             关闭时需要你手动点发布。
           </div>
         </div>
@@ -82,6 +91,51 @@ export function Publish() {
         >
           {auto ? '已开启' : '已关闭'}
         </button>
+      </Card>
+
+      <Card className="mb-5">
+        <div className="flex items-center gap-3 flex-wrap">
+          <span className="text-sm text-ink-600">发布时间</span>
+          <select
+            className="input w-32"
+            value={parts.freq}
+            onChange={(e) => {
+              const freq = e.target.value as 'daily' | 'weekly' | 'hourly';
+              setParts({ ...parts, freq });
+              api.post('/api/settings', { schedulePublish: partsToCron({ ...parts, freq }) });
+            }}
+          >
+            <option value="daily">每天</option>
+            <option value="weekly">每周</option>
+            <option value="hourly">每隔几小时</option>
+          </select>
+          {parts.freq === 'hourly' ? (
+            <div className="flex items-center gap-1.5">
+              <span className="text-sm text-ink-500">每</span>
+              <input
+                type="number" min={1} max={23} className="input w-20"
+                value={parts.everyNHours}
+                onChange={(e) => {
+                  const v = { ...parts, everyNHours: Number(e.target.value) };
+                  setParts(v);
+                  api.post('/api/settings', { schedulePublish: partsToCron(v) });
+                }}
+              />
+              <span className="text-sm text-ink-500">小时</span>
+            </div>
+          ) : (
+            <input
+              type="time" className="input w-32"
+              value={parts.time}
+              onChange={(e) => {
+                const v = { ...parts, time: e.target.value };
+                setParts(v);
+                api.post('/api/settings', { schedulePublish: partsToCron(v) });
+              }}
+            />
+          )}
+          <span className="text-xs text-ink-500">{describeSchedule(parts)}</span>
+        </div>
       </Card>
 
       {queue.length === 0 ? (
