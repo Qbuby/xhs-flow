@@ -65,6 +65,24 @@ export function countEmoji(s: string): number {
   );
 }
 
+/**
+ * 去掉 emoji 及其配套字符（变体选择符、零宽连接符、肤色修饰符、数字键帽）。
+ *
+ * 为什么在渲染层做而不是只写进 prompt：卡片是**矢量排版**，
+ * emoji 在 Chromium 里走彩色位图字体，跟卡片配色和字重完全不搭，
+ * 一出现就破坏整张版面的统一感；而且不同语料库的 emoji 密度差很多，
+ * 只靠 prompt 拦不住。放进这里兜底，任何来源的文案进卡片前都会被清一遍。
+ */
+export function stripEmoji(s: string): string {
+  return s
+    .replace(
+      /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{2190}-\u{21FF}\u{2460}-\u{24FF}\u{FE0F}\u{200D}\u{20E3}\u{1F3FB}-\u{1F3FF}]/gu,
+      '',
+    )
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/ +\n/g, '\n');
+}
+
 /** 从文案里抽 #话题 标签。 */
 export function extractTags(s: string): string[] {
   return [...s.matchAll(/#([^#\s，。！？、；：,.!?;:\n]{1,20})/g)].map((m) => (m[1] as string).trim());

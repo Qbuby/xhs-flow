@@ -18,6 +18,14 @@ import { logger } from '../logger.js';
 import { logEvent, run, all, get, transaction } from '../db/index.js';
 import { parseInitialState, extractTags } from '../util/text.js';
 import { throttle } from '../util/throttle.js';
+import {
+  PAUSE,
+  enforceBrowse,
+  humanPause,
+  humanScroll,
+  maybeDistracted,
+  noteBrowseStart,
+} from '../util/human.js';
 import { downloadImage } from '../media/download.js';
 import sharp from 'sharp';
 
@@ -270,7 +278,7 @@ async function listNotesViaDomScroll(userId: string, max: number): Promise<Liste
       waitUntil: 'domcontentloaded',
       timeout: 45_000,
     });
-    await page.waitForTimeout(3000);
+    await humanPause(PAUSE.readShort);
 
     const seen = new Map<string, string | null>();
     let stagnant = 0;
@@ -300,9 +308,9 @@ async function listNotesViaDomScroll(userId: string, max: number): Promise<Liste
         stagnant = 0;
       }
 
-      await page.mouse.wheel(0, 2400);
-      await page.waitForTimeout(1200 + Math.random() * 800);
-      await throttle();
+      // 同样分格滚动 + 停顿，不再一步 2400px
+      await humanScroll(page, { distance: 500 + Math.random() * 900 });
+      await maybeDistracted();
     }
 
     if (seen.size === 0) return null;
@@ -447,6 +455,8 @@ export interface ScrapeOptions {
   downloadImages?: boolean;
   onProgress?: ProgressFn;
   signal?: AbortSignal;
+  /** 定时/自动触发时为 true —— 会严格执行访问额度与安静时段。手动点不受阻。 */
+  auto?: boolean;
 }
 
 export interface ScrapeResult {
@@ -459,6 +469,13 @@ export interface ScrapeResult {
 
 export async function scrapeAuthor(opts: ScrapeOptions): Promise<ScrapeResult> {
   const { profileUrl, maxNotes = 200, maxNew = Infinity, downloadImages = true, onProgress = () => {}, signal } = opts;
+
+  // 风控闸门。抓主页是这套系统里最重的浏览行为，必须过冷静期、安静时段、
+  // 日额度和最小间隔。定时抓会被直接拒绝；手动抓在路由层就已经返回 429 了，
+  // 这里再拦一次是防「点了之后排队、真跑的时候条件已经变了」。
+  const gate = enforceBrowse('scrape', { auto: opts.auto });
+  if (!gate.ok) throw new Error(`防风控拦截：${gate.reason}`);
+  noteBrowseStart('scrape');
 
   const sourceId = upsertSource(profileUrl, { status: 'scraping' });
   const { userId: urlUserId, xsecToken } = parseProfileUrl(profileUrl);
@@ -595,8 +612,10 @@ export async function scrapeAuthor(opts: ScrapeOptions): Promise<ScrapeResult> {
   let skipped = 0;
   let consecutiveDetailFailures = 0;
 
-  // 标签页常驻复用，不再一篇一个
-  const reader = await createNoteReader();
+  // 标签页常驻复用，不再一篇一个。
+  // 传 userId 让它走「从主页网格点开」的拟人路径（见 scrape-browser.ts）——
+  // 直接 goto /explore/<id> 会让每篇之间的间隔变得整齐，而那正是风控的判据。
+  const reader = await createNoteReader(userId);
 
   for (const [i, item] of target.entries()) {
     if (signal?.aborted) break;

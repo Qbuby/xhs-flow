@@ -13,7 +13,18 @@ interface Settings {
     keyMasked: string;
     fromEnv: boolean;
   };
-  schedule: { generate: string; publish: string; autoPublish: boolean };
+  schedule: {
+    generate: string;
+    publish: string;
+    autoPublish: boolean;
+    autoCompose: boolean;
+    autoIdeate: boolean;
+    composePerRun: number;
+    ideatePerRun: number;
+    rescrape: string;
+    rescrapeBatch: number;
+    pauseUntil: string;
+  };
 }
 
 export function Settings() {
@@ -27,6 +38,7 @@ export function Settings() {
   const [checking, setChecking] = useState('');
   const [busy, setBusy] = useState('');
   const [result, setResult] = useState<string>('');
+  const [pauseUntil, setPauseUntil] = useState('');
   const [llmApi, setLlmApi] = useState<'openai' | 'anthropic'>('anthropic');
   const [llmBase, setLlmBase] = useState('');
   const [llmModel, setLlmModel] = useState('');
@@ -46,6 +58,7 @@ export function Settings() {
       setBrand(s.brand);
       setGenerate(s.schedule.generate);
       setPublish(s.schedule.publish);
+      setPauseUntil(s.schedule.pauseUntil ?? '');
       setHealth(h);
       setEvents(e);
       setJobs(j);
@@ -73,6 +86,7 @@ export function Settings() {
         brand,
         scheduleGenerate: generate,
         schedulePublish: publish,
+        pauseUntil,
       });
       toast('已保存');
       void load();
@@ -167,6 +181,37 @@ export function Settings() {
           />
           <div className="text-[11px] text-ink-400 mb-4">
             仅在「发布」页开启自动发布后生效
+          </div>
+
+          <label className="label">处置冷静期（留空 = 不启用）</label>
+          <input
+            className="input mb-1 font-mono"
+            placeholder="2026-10-17 16:00"
+            value={pauseUntil}
+            onChange={(e) => setPauseUntil(e.target.value)}
+          />
+          <div className="text-[11px] text-ink-400 mb-4 leading-relaxed">
+            账号被平台处置期间填这里。到期自动失效。
+            <br />
+            <span className="text-amber-700">
+              这段时间的访问注定失败，还会落在平台的观察窗口里 ——
+              所以这个闸连手动抓取和发布也会拒绝，别去「试试它恢复没有」。
+            </span>
+            <br />
+            <button
+              type="button"
+              className="text-accent-500 hover:underline mt-1"
+              onClick={() =>
+                setPauseUntil(
+                  new Date(Date.now() + 7 * 24 * 3600 * 1000)
+                    .toISOString()
+                    .slice(0, 16)
+                    .replace('T', ' '),
+                )
+              }
+            >
+              填入「一周后」的日期
+            </button>
           </div>
 
           <button className="btn-primary" onClick={() => void save()}>

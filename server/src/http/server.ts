@@ -29,7 +29,7 @@ import { signerState, resetSigner } from '../xhs/signing.js';
 import { getStyleProfile } from '../corpus/profile.js';
 import { composeDraft, ideateTopics, renderDraftCards } from '../generate/pipeline.js';
 import { DEFAULT_SPEC, renderCard } from '../generate/cards.js';
-import { enqueue, schedulerInfo, runNow } from '../scheduler/jobs.js';
+import { autoPublishEnabled, enqueue, schedulerInfo, runNow } from '../scheduler/jobs.js';
 import { approvedDrafts } from '../xhs/publish.js';
 import { llmHealth, llmInfo } from '../llm/client.js';
 import {
@@ -39,12 +39,13 @@ import {
   maskKey,
 } from '../llm/runtime.js';
 import { activeProviders } from '../media/stock.js';
+import { browseBudget, enforceBrowse, inCooldown, noteBrowseStart, quietHoursNow } from '../util/human.js';
 
 /** 把 cron 表达式翻译成「下一次会是什么时候」，创作台要显示。 */
 function nextRunTimes(): { generate: string | null; publish: string | null; rescrape: string | null } {
   const gen = getSetting('schedule_generate') ?? config.schedule.generate;
   const pub = getSetting('schedule_publish') ?? config.schedule.publish;
-  const re = getSetting('schedule_rescrape') ?? '0 4 * * *';
+  const re = getSetting('schedule_rescrape') ?? '40 10 * * *';
   const calc = (p: string): string | null => {
     if (!p?.trim()) return null;
     try {
@@ -93,6 +94,15 @@ export async function buildServer() {
       },
       signer: signerState(),
       scheduler: schedulerInfo(),
+      // 防风控余量。账号已被处置过一次（2026-10-10 曝光受限一周），
+      // 「今天还能不能动」必须直接在界面上可见，而不是藏在日志里。
+      risk: {
+        quietHours: config.risk.quietHours,
+        inQuietHours: quietHoursNow(),
+        useRealChrome: config.risk.useRealChrome,
+        cooldown: inCooldown(),
+        budget: browseBudget(),
+      },
     };
   });
 
@@ -111,14 +121,16 @@ export async function buildServer() {
     schedule: {
       generate: getSetting('schedule_generate') ?? config.schedule.generate,
       publish: getSetting('schedule_publish') ?? config.schedule.publish,
-      autoPublish: (getSetting('auto_publish') ?? String(config.publish.auto)) === 'true',
+      autoPublish: autoPublishEnabled(),
       // 创作台的新配置
       autoCompose: (getSetting('auto_compose') ?? 'false') === 'true',
       autoIdeate: (getSetting('auto_ideate') ?? 'true') === 'true',
       composePerRun: Number(getSetting('compose_per_run') ?? '1'),
       ideatePerRun: Number(getSetting('ideate_per_run') ?? '6'),
-      rescrape: getSetting('schedule_rescrape') ?? '0 4 * * *',
+      rescrape: getSetting('schedule_rescrape') ?? '40 10 * * *',
       rescrapeBatch: Number(getSetting('rescrape_batch') ?? '30'),
+      // 冷静期（本地时间字符串，空 = 未启用）
+      pauseUntil: getSetting('pause_until') ?? '',
     },
     nextRun: nextRunTimes(),
     };
@@ -139,6 +151,21 @@ export async function buildServer() {
     setStr('ideate_per_run', body.ideatePerRun);
     setStr('schedule_rescrape', body.rescrape);
     setStr('rescrape_batch', body.rescrapeBatch);
+    // 冷静期。空字符串是有效值（= 清除冷静期），所以不能用 setStr 的
+    // 「undefined 才跳过」语义 —— 用户清空输入框就是要解除它。
+    if (typeof body.pauseUntil === 'string') {
+      const v = body.pauseUntil.trim();
+      if (!v) {
+        setSetting('pause_until', '');
+      } else {
+        const t = new Date(v.replace(' ', 'T'));
+        if (Number.isNaN(t.getTime())) {
+          reply.code(400);
+          return { error: `冷静期时间格式无法解析：${v}（应为 2026-10-17 16:00 这种形式）` };
+        }
+        setSetting('pause_until', v);
+      }
+    }
     // 模型配置。key 只在非空时更新 —— 界面上留空表示「保持现状」，
     // 不然掩码显示的占位符一保存就把真 key 冲掉了。
     setStr('llm_api', typeof body.llmApi === 'string' && ['openai','anthropic'].includes(body.llmApi) ? body.llmApi : undefined);
@@ -195,12 +222,14 @@ export async function buildServer() {
 
   app.get('/api/login/status', async () => {
     const snap = await browser.snapshot({ onlyIfRunning: true }).catch(() => null);
+    // checkIpBlocked 会打开/复用一个 xiaohongshu.com 页面，本质上是一次浏览。
+    // 冷静期里连这个也不做 —— 「看一下有没有被墙」和「去试试恢复没有」是一回事。
+    const mayProbeIp = !snap?.skipped && !inCooldown().active;
     return {
       ...snap,
       signer: signerState(),
       browserRunning: browser.isRunning(),
-      // 只有用户主动点登录/抓取时才会真正启动浏览器
-      ipBlocked: snap?.skipped ? null : await browser.checkIpBlocked(),
+      ipBlocked: mayProbeIp ? await browser.checkIpBlocked() : null,
     };
   });
 
@@ -216,6 +245,13 @@ export async function buildServer() {
   });
 
   app.post('/api/login/qr', async (_req, reply) => {
+    // 冷静期里连扫码也不该做 —— 打开小红书首页本身就是一次浏览行为。
+    const gate = enforceBrowse('login', { auto: false });
+    if (!gate.ok) {
+      reply.code(429);
+      return { error: gate.reason ?? '防风控拦截' };
+    }
+
     // 已经有登录态就别去找二维码了 —— 已登录时小红书根本不弹登录框，
     // 硬找只会得到一句莫名其妙的「页面可能已改版」。
     const snap = await browser.snapshot({ onlyIfRunning: true }).catch(() => null);
@@ -260,7 +296,15 @@ export async function buildServer() {
     return { ok: true };
   });
 
-  app.post('/api/health/check', async () => {
+  app.post('/api/health/check', async (_req, reply) => {
+    // 这会打一次真实签名的 /user/me —— 是货真价实的一次小红书 API 调用。
+    // 冷静期里不该发生，用户点「检测」时得明确告诉他为什么不做。
+    const gate = enforceBrowse('healthcheck', { auto: false });
+    if (!gate.ok) {
+      reply.code(429);
+      return { error: gate.reason ?? '防风控拦截' };
+    }
+    noteBrowseStart('healthcheck');
     const cookie = await browser.healthCheck();
     const llm = await llmHealth();
     return { cookie, llm };
@@ -335,7 +379,7 @@ export async function buildServer() {
    * `maxNotes` 传 null 表示「一次抓到作者全部作品」；
    * 数字则表示「本次最多新增这么多篇」，避免一次拉太多触发风控。
    */
-  app.post('/api/sources/:id/scrape', async (req) => {
+  app.post('/api/sources/:id/scrape', async (req, reply) => {
     const id = Number((req.params as { id: string }).id);
     const body = (req.body ?? {}) as { maxNotes?: number | null; downloadImages?: boolean };
     const src = get<{ profile_url: string; note_count: number }>(
@@ -343,6 +387,19 @@ export async function buildServer() {
       id,
     );
     if (!src) return { error: '语料源不存在' };
+
+    // 闸门不过就当面说清楚，绝不静默失败 —— 否则用户以为是 bug，再点几次，
+    // 而「反复重试」正是风控最想看到的形状。
+    const gate = enforceBrowse('scrape', { auto: false });
+    if (!gate.ok) {
+      reply.code(429);
+      return {
+        error: gate.reason ?? '防风控拦截',
+        hint: gate.waitMin
+          ? `还要等约 ${gate.waitMin} 分钟。`
+          : '这是防风控的硬约束，不是故障。',
+      };
+    }
 
     // maxNotes = 本次要**新增**多少篇（不是总共处理多少条）。
     // 列表阶段单独给足覆盖量，否则会把作者几百篇旧作翻个遍才凑够数。
@@ -360,6 +417,7 @@ export async function buildServer() {
         { profileUrl: src.profile_url, maxNotes: listed, maxNew, downloadImages: body.downloadImages ?? true },
         { dedupeKey: `scrape:${id}` },
       ),
+      budget: gate,
     };
   });
 
@@ -556,9 +614,30 @@ export async function buildServer() {
 
   app.get('/api/publish/queue', async () => approvedDrafts());
 
-  app.post('/api/publish/run', async () => ({ jobId: enqueue('publish', {}) }));
-  app.post('/api/publish/:id', async (req) => {
+  app.post('/api/publish/run', async (_req, reply) => {
+    // 发布是最重的一次会话（打开创作中心、传图、填表、点发布）。
+    // 冷静期 / 安静时段 / 额度 / 间隔任一不过就直接拒绝，并把原因说清楚。
+    const gate = enforceBrowse('publish', { auto: false });
+    if (!gate.ok) {
+      reply.code(429);
+      return {
+        error: gate.reason ?? '防风控拦截',
+        hint: gate.waitMin ? `还要等约 ${gate.waitMin} 分钟。` : undefined,
+      };
+    }
+    return { jobId: enqueue('publish', {}) };
+  });
+
+  app.post('/api/publish/:id', async (req, reply) => {
     const id = Number((req.params as { id: string }).id);
+    const gate = enforceBrowse('publish', { auto: false });
+    if (!gate.ok) {
+      reply.code(429);
+      return {
+        error: gate.reason ?? '防风控拦截',
+        hint: gate.waitMin ? `还要等约 ${gate.waitMin} 分钟。` : undefined,
+      };
+    }
     const r = run("UPDATE drafts SET status='approved' WHERE id=? AND status <> 'published'", id);
     return { ok: r.changes > 0, jobId: enqueue('publish', {}) };
   });

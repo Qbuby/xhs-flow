@@ -71,12 +71,27 @@ export interface AppConfig {
     delaySigma: number;
   };
   schedule: {
+    /**
+     * 默认值刻意避开整点和等间隔。
+     * 「每两小时整点」在风控看来就是一条等距的时间线；
+     * 真人一天去创作中心两三次，而且不会恰好都在整点。
+     */
     generate: string;
     publish: string;
   };
   publish: {
     auto: boolean;
     intervalSec: number;
+  };
+  /**
+   * 防风控。2026-10-10 账号因「浏览行为异常或不规律」被限制曝光，
+   * 之后所有自动化浏览都要过这里这几道闸。
+   */
+  risk: {
+    /** 安静时段 "23:30-07:30"，跨零点支持。自动任务在此期间不动小红书。 */
+    quietHours: string;
+    /** 用本机真实安装的 Chrome 而不是 Playwright 自带的 Chromium。 */
+    useRealChrome: boolean;
   };
 }
 
@@ -111,13 +126,20 @@ export const config: AppConfig = {
   },
 
   schedule: {
-    generate: str(process.env.XHSFLOW_SCHEDULE_GENERATE, '30 9 * * *'),
-    publish: str(process.env.XHSFLOW_SCHEDULE_PUBLISH, '0 */2 * * *'),
+    // 09:30 → 10:20：早上的第一件事应该是看数据，不是发稿
+    generate: str(process.env.XHSFLOW_SCHEDULE_GENERATE, '20 10 * * *'),
+    // 每两小时整点 → 一天三次、时刻错开
+    publish: str(process.env.XHSFLOW_SCHEDULE_PUBLISH, '25 10,16,21 * * *'),
   },
 
   publish: {
     auto: bool(process.env.XHSFLOW_PUBLISH_AUTO, false),
     intervalSec: num(process.env.XHSFLOW_PUBLISH_INTERVAL_SEC, 45),
+  },
+
+  risk: {
+    quietHours: str(process.env.XHSFLOW_QUIET_HOURS, '23:30-07:30'),
+    useRealChrome: bool(process.env.XHSFLOW_USE_REAL_CHROME, true),
   },
 };
 

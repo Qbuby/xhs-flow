@@ -1,10 +1,12 @@
 import { chromium } from 'playwright';
 import type { BrowserContext, Page } from 'playwright';
 import path from 'node:path';
+import fs from 'node:fs';
 import { PROFILE_DIR, config } from '../config.js';
 import { logger } from '../logger.js';
 import { logEvent, setSetting } from '../db/index.js';
 import { sleep } from '../util/throttle.js';
+import { noteBrowseStart } from '../util/human.js';
 import { sign } from './signing.js';
 
 export const XHS_ORIGIN = 'https://www.xiaohongshu.com';
@@ -26,6 +28,87 @@ export interface CookieSnapshot {
 }
 
 const HEADLESS = /^(1|true|yes|on)$/i.test(process.env.XHSFLOW_BROWSER_HEADLESS ?? 'false');
+
+/**
+ * 常见真实 Chrome 安装位置。用真 Chrome 而不是 Playwright 自带的 Chromium，
+ * 是因为后者带着一堆可以离线判定的特征（构建号不在 Chrome 的发布序列里、
+ * 缺少 Widevine、`chrome://version` 的命令行含 --enable-automation…）。
+ * 风控要做浏览器指纹比对时，这些都是白送的线索。
+ */
+const CHROME_PATHS = [
+  process.env.XHSFLOW_CHROME_PATH,
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/usr/bin/google-chrome',
+].filter((p): p is string => Boolean(p));
+
+function findRealChrome(): string | undefined {
+  if (!config.risk.useRealChrome) return undefined;
+  return CHROME_PATHS.find((p) => {
+    try {
+      return fs.existsSync(p);
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * 读本机 Chrome 的真实主版本号。
+ *
+ * 这个数字必须准：UA 里写 131 而实测内核是 154，等于自己招了 ——
+ * 风控只要比对 UA 与内核特性就对不上。Chrome 的安装目录下有个以版本号
+ * 命名的子目录（`Application/154.0.8037.98/`），从那里读最省事。
+ */
+function chromeMajorVersion(chromePath: string): string | undefined {
+  const override = process.env.XHSFLOW_CHROME_VERSION;
+  if (override && /^\d+$/.test(override)) return override;
+
+  try {
+    const dir = path.dirname(chromePath);
+    const versions = fs
+      .readdirSync(dir)
+      .map((name) => /^(\d+)\.\d+\.\d+\.\d+$/.exec(name)?.[1])
+      .filter((v): v is string => Boolean(v))
+      .map(Number)
+      .sort((a, b) => b - a);
+    if (versions.length > 0) return String(versions[0]);
+  } catch {
+    /* 读不到就退回下面的默认值 */
+  }
+
+  // macOS/Linux 的目录布局不同，退回一个保守值（只影响 UA 字符串）
+  return undefined;
+}
+
+/**
+ * 反检测初始化脚本。必须在任何页面脚本之前跑（addInitScript）。
+ *
+ * 只做两件事，不多做：
+ *  1. 摘掉 `navigator.webdriver`（Playwright 默认会把它设成 true）
+ *  2. 补上无头模式缺失的插件/languages —— 有头模式本来就有，这里只是兜底
+ *
+ * 刻意**不**去改 WebGL / canvas / 字体等指纹：一是那些改动一旦做歪，
+ * 制造出来的反而是更稀有的指纹，比不改更容易被识别；二是真 Chrome
+ * 的指纹本来就是真 Chrone 的，改它没有收益。
+ */
+const ANTI_DETECT = () => {
+  Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+  Object.defineProperty(navigator, 'languages', {
+    get: () => ['zh-CN', 'zh', 'en'],
+    configurable: true,
+  });
+  if (!navigator.plugins || navigator.plugins.length === 0) {
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [{ name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }],
+      configurable: true,
+    });
+  }
+  // 无头模式下 window.chrome 是空的，有头模式有 —— 补齐
+  const w = window as unknown as { chrome?: Record<string, unknown> };
+  if (!w.chrome) w.chrome = { runtime: {} };
+};
 
 /**
  * 清理占着 profile 锁的僵尸浏览器。
@@ -156,10 +239,9 @@ class BrowserSession {
     this.launching = (async () => {
       const ctx = await this.launch();
 
-      // 把 webdriver 标记摘掉，这是最基础的一层反检测
-      await ctx.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      });
+      // 反检测基线。必须在任何页面创建之前注入 ——
+      // 页面脚本一跑起来就读 navigator.webdriver，注入晚了就白费。
+      await ctx.addInitScript(ANTI_DETECT);
 
       ctx.on('close', () => {
         this.ctx = null;
@@ -177,17 +259,38 @@ class BrowserSession {
 
   /** 带僵尸锁自愈的启动。 */
   private async launch(): Promise<BrowserContext> {
+    const chromePath = findRealChrome();
+    // 视口随机一次并固定下来：真人不会每次刷新都换一个完全一致的窗口尺寸，
+    // 但也绝不会边看边变。1440×900 是这台机器上的常见值，所以作为基准。
+    const width = 1380 + Math.floor(Math.random() * 120);
+    const height = 860 + Math.floor(Math.random() * 80);
+
     const opts = {
       headless: HEADLESS,
-      viewport: { width: 1440, height: 900 },
+      viewport: { width, height },
       locale: 'zh-CN',
       timezoneId: 'Asia/Shanghai',
+      // 让 UA 的版本号跟真实 Chrome 一致，而不是 Chromium 的构建号
+      userAgent: chromePath
+        ? `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeMajorVersion(chromePath) ?? '131'}.0.0.0 Safari/537.36`
+        : undefined,
       args: [
         '--disable-blink-features=AutomationControlled',
         '--no-default-browser-check',
         '--disable-features=IsolateOrigins,site-per-process',
+        // 有头模式下也把「Chrome 正受到自动测试软件的控制」那条信息栏压掉
+        '--disable-infobars',
+        '--no-first-run',
+        '--no-service-autorun',
+        '--password-store=basic',
+        // 关掉「自动化产物」相关的开关，减少可离线判定的特征
+        '--disable-dev-shm-usage',
+        '--disable-popup-blocking',
       ],
+      ...(chromePath ? { executablePath: chromePath } : {}),
     };
+
+    if (chromePath) logger.info({ chromePath, width, height }, '使用本机真实 Chrome 启动');
 
     try {
       logger.info({ profileDir: PROFILE_DIR, headless: HEADLESS }, '启动浏览器会话');
@@ -291,6 +394,10 @@ class BrowserSession {
   async startQrLogin(timeoutMs = 180_000): Promise<{ qr: Buffer; promise: Promise<boolean> }> {
     const ctx = await this.ensureLaunched();
     const page = await ctx.newPage();
+
+    // 登录同样是一次完整的小红书会话。记进额度里 ——
+    // 「一天里反复走扫码流程」也是风控会看的形状。
+    noteBrowseStart('login');
 
     await safeGoto(page, `${XHS_ORIGIN}/explore`);
     // 小红书首屏会自我跳转/懒加载，且登录弹窗是**自动弹出**的

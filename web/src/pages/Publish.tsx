@@ -13,6 +13,7 @@ import { cronToParts, partsToCron, describeSchedule, describeNext } from '../uti
 
 export function Publish() {
   const [queue, setQueue] = useState<Draft[]>([]);
+  const [history, setHistory] = useState<Draft[]>([]);
   const [running, setRunning] = useState(false);
   const [auto, setAuto] = useState(false);
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -20,13 +21,15 @@ export function Publish() {
 
   async function load() {
     try {
-      const [d, s] = await Promise.all([
+      const [d, s, h] = await Promise.all([
         api.get<Draft[]>('/api/drafts?status=approved'),
         api.get<{ schedule: { publish: string; autoPublish: boolean } }>('/api/settings'),
+        api.get<Draft[]>('/api/drafts?status=published'),
       ]);
       setQueue(d);
       setAuto(s.schedule.autoPublish);
       setParts(cronToParts(s.schedule.publish));
+      setHistory(h);
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'err');
     }
@@ -160,6 +163,45 @@ export function Publish() {
           ))}
         </div>
       )}
+
+      <div className="mt-8">
+        <SectionTitle
+          title="发布记录"
+          desc={`已成功发布 ${history.length} 篇`}
+        />
+        {history.length === 0 ? (
+          <Empty>还没有发布成功的笔记</Empty>
+        ) : (
+          <div className="space-y-2">
+            {history.map((d) => (
+              <Card key={d.id} className="py-3 flex items-center gap-3">
+                <div className="flex-1 min-w-0">
+                  <div className="font-medium text-ink-900 truncate">{d.title}</div>
+                  <div className="text-[11px] text-ink-400 mt-0.5">
+                    发布于 {d.published_at ?? '—'}
+                    {d.nickname ? ` · ${d.nickname}` : ''}
+                  </div>
+                </div>
+                {d.published_url ? (
+                  <a
+                    href={d.published_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="btn-ghost shrink-0"
+                  >
+                    打开笔记
+                  </a>
+                ) : (
+                  <span className="badge bg-ink-100 text-ink-500 shrink-0">无链接</span>
+                )}
+                <Link to={`/drafts/${d.id}`} className="btn-ghost shrink-0">
+                  详情
+                </Link>
+              </Card>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

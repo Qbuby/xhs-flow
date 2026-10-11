@@ -3,6 +3,7 @@ import sharp from 'sharp';
 import { browser } from '../xhs/browser.js';
 import { MEDIA_DIR } from '../config.js';
 import { getStyleProfile, type CardTemplateSpec } from '../corpus/profile.js';
+import { stripEmoji } from '../util/text.js';
 import { logger } from '../logger.js';
 import path from 'node:path';
 import fs from 'node:fs/promises';
@@ -59,7 +60,8 @@ export const DEFAULT_SPEC: CardTemplateSpec = {
   font_weight_bold: 800,
   radius: 28,
   accent_style: 'highlight',
-  decoration: 'emoji',
+  // 默认不用 emoji 装饰：卡片是矢量排版，彩色 emoji 会破坏字重与配色统一
+  decoration: 'none',
   background_image: 'gradient',
   text_ratio: 0.6,
 };
@@ -75,7 +77,9 @@ export function specForSource(sourceId: number | null): CardTemplateSpec {
 /* ------------------------------------------------------------------ */
 
 function esc(v: unknown): string {
-  return String(v ?? '')
+  // 卡片是矢量排版，彩色 emoji 会破坏字重与配色统一 —— 统一在渲染入口清掉，
+  // 不依赖 prompt 或语料库自我约束。
+  return stripEmoji(String(v ?? ''))
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -265,9 +269,11 @@ function layoutBody(
     }
 
     case 'cta': {
+      // 不放 emoji：卡片是矢量排版，彩色 emoji 会破坏字重与配色的统一。
+      // 需要视觉重心就用一条 accent 短线代替。
       return `
         <div style="text-align:center;display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1">
-          <div style="font-size:${spec.title_size + 26}px;margin-bottom:34px">${esc(b.emoji ?? '👋')}</div>
+          <div style="width:72px;height:6px;border-radius:3px;background:${spec.accent};margin-bottom:44px"></div>
           <div class="title" style="font-size:${spec.title_size}px;text-align:center">${highlight(String(b.title ?? ''), spec)}</div>
           <div class="body" style="font-size:${spec.body_size + 4}px;margin-top:36px;text-align:center;
                background:${spec.accent}22;color:${spec.accent};padding:22px 44px;border-radius:999px;font-weight:700">

@@ -39,6 +39,15 @@ export const api = {
 
 /* ----------------------------- 类型 ----------------------------- */
 
+export interface BrowseBudget {
+  kind: 'scrape' | 'publish' | 'healthcheck' | 'login';
+  ok: boolean;
+  reason?: string;
+  used: number;
+  limit: number;
+  waitMin?: number;
+}
+
 export interface Health {
   ok: boolean;
   llm: { profile: string; baseURL: string; model: string; hasKey: boolean };
@@ -47,6 +56,13 @@ export interface Health {
   stockProviders: { name: string; keyless: boolean }[];
   browser: { running: boolean; hasSession: boolean; unknown?: boolean; missingCookies: string[]; lastCheckedAt?: string | null };
   signer: { ready: boolean; diagnostic: string };
+  risk?: {
+    quietHours: string;
+    inQuietHours: boolean;
+    useRealChrome: boolean;
+    cooldown: { active: boolean; until?: string; untilLocal?: string; leftHours?: number };
+    budget: BrowseBudget[];
+  };
   scheduler: {
     running: boolean;
     generate: string;

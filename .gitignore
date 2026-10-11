@@ -21,3 +21,6 @@ Thumbs.db
 
 # 编辑器/工具的本地会话产物
 .zcode/
+# 一次性 DOM 探针（probe-creator*.ts）：逆向创作中心时的临时脚本，
+# 发现的选择器/流程已沉淀进 xhs/publish.ts 的注释与 verify-publish.ts，本地留着备查即可
+server/src/diagnostics/probe-creator*.ts

@@ -20,7 +20,8 @@ const SPEC = {
   title_size: 72,
   body_size: 34,
   accent_style: 'highlight' as const,
-  decoration: 'emoji' as const,
+  // 自检样例也跟着走"不用 emoji 装饰"的默认取向，确认实际产出长什么样
+  decoration: 'none' as const,
   background_image: 'gradient' as const,
   font_family: '"Microsoft YaHei", "微软雅黑", "PingFang SC", sans-serif',
 };
@@ -101,7 +102,6 @@ const CARDS: Card[] = [
   {
     layout: 'cta',
     blocks: {
-      emoji: '👋',
       title: '你家厨房\n最大的问题是啥？',
       action: '评论区告诉我，我帮你看看怎么改',
       brand: '小家研究所',

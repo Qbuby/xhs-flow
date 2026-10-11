@@ -6,6 +6,7 @@ import { retrieveWithFallback, type RetrievedNote } from '../corpus/retrieve.js'
 import { logger } from '../logger.js';
 import { MEDIA_DIR } from '../config.js';
 import { renderCards, type Card, type Layout, LAYOUTS } from './cards.js';
+import { stripEmoji } from '../util/text.js';
 import path from 'node:path';
 
 /* ------------------------------------------------------------------ */
@@ -32,7 +33,21 @@ const SYSTEM = `你是一位小红书爆款内容操盘手，正在为一个自�
 你的创作必须**严格模仿指定博主的风格**，而不是套用通用的"小红书爆款公式"。
 语料里给出的样稿是这个博主真实写过的内容，你的任务是抽取它的规律并迁移到新选题上。
 
-铁律：
+【品质底线 —— 任何语料库、任何选题都必须满足】
+1. **正文必须有排版**：用空行分成 3-6 段，段落之间用 \\n\\n 分隔。
+   绝不允许把整篇挤成一整块连续文字。每段 2-4 行，长短交替，读起来有呼吸感。
+2. **不要 emoji**：正文、标题、卡片文案里都**不要出现任何 emoji 表情符号**。
+   需要节奏感就用中文标点和分行来做，不要靠图标。
+3. **表达要精炼克制，不油腻**：写具体的事实、数字、判断和取舍，
+   不要"绝绝子""yyds""宝藏""姐妹们冲"这类廉价网感词，
+   也不要"赋能""抓手"这类空转的黑话。宁可句子短一点、信息密度高一点。
+4. **要有专业纵深**：每篇至少给出 2 个别人不容易说出来的具体结论
+   （可量化的数字、可执行的判断标准、真实的取舍代价），
+   而不是"要注意质量""要坚持长期"这种正确的废话。
+5. **排版符号克制**：可以用 ①②③ 和「」这类中文标点做结构标记，
+   但同一篇里只用一种编号方式，不要混用 ·-•① 一大串。
+
+【技术铁律】
 1. 标题必须 ≤20 个字符（小红书会截断），要有钩子但不能标题党。
 2. 卡片文案要口语化、有节奏、能独立成立，不要写成说明书。
 3. 关键词要打成 [[方括号]] 标记强调，渲染器会把它变成高亮样式。
@@ -54,7 +69,8 @@ function buildStyleBlock(profile: StyleProfile | null): string {
     ...profile.language.title_formulas.map((f) => `    · ${f}`),
     `- 标题平均字数：${profile.language.avg_title_chars}（控制在 ${Math.max(10, profile.language.avg_title_chars - 4)}~${profile.language.avg_title_chars + 6} 字）`,
     `- 正文长度：${profile.language.body_chars_range}`,
-    `- 每百字 emoji 数：${profile.language.emoji_per_100_chars}`,
+    `- 原作者的 emoji 密度：每百字 ${profile.language.emoji_per_100_chars} 个`,
+    `  ⚠️ 仅供参考，**你产出的内容不要用任何 emoji**（见下方"必须避免"）`,
     `- 口头禅：${profile.language.signature_phrases.join('、')}`,
     `- 开头套路：${profile.language.opening_patterns.join('；')}`,
     `- 结尾套路：${profile.language.ending_patterns.join('；')}`,
@@ -70,6 +86,9 @@ function buildStyleBlock(profile: StyleProfile | null): string {
     '',
     '【必须避免】',
     ...profile.dont_list.map((d) => `    ✗ ${d}`),
+    '    ✗ 使用任何 emoji 表情符号（这是硬性要求，比模仿该博主的 emoji 习惯优先）',
+    '    ✗ 把正文写成一整块连续文字（必须分段）',
+    '    ✗ "绝绝子/宝藏/yyds/赋能/抓手"这类空转的词',
   ].join('\n');
 }
 
@@ -109,7 +128,7 @@ function buildExamplesBlock(examples: RetrievedNote[]): string {
  */
 const DRAFT_TEMPLATE = `{
   "title": "20 字以内的标题",
-  "body": "完整正文，1000 字以内，可含 #话题",
+  "body": "第一段…\\n\\n第二段…\\n\\n第三段…（段间必须有空行，不要挤成一整块）",
   "tags": ["话题1", "话题2"],
   "cards": [
     { "layout": "cover", "blocks": { "eyebrow": "短标签", "title": "主标题，用 [[强调]]", "items": ["短句1", "短句2"], "hint": "引导语" } },
@@ -118,7 +137,7 @@ const DRAFT_TEMPLATE = `{
     { "layout": "steps", "blocks": { "eyebrow": "怎么做", "title": "标题", "items": [{ "text": "步骤", "note": "说明" }] } },
     { "layout": "compare", "blocks": { "eyebrow": "对比", "title": "标题", "left": { "title": "A", "items": ["…"] }, "right": { "title": "B", "items": ["…"] }, "conclusion": "结论" } },
     { "layout": "photo_text", "blocks": { "title": "标题", "subtitle": "副标题", "photoQuery": "配图检索词" } },
-    { "layout": "cta", "blocks": { "emoji": "👋", "title": "标题", "action": "引导语" } }
+    { "layout": "cta", "blocks": { "title": "标题", "action": "引导语" } }
   ]
 }`;
 
@@ -159,7 +178,13 @@ export async function composeDraft(opts: {
     '- steps：title + items[{text, note}]，3-5 步',
     '- compare：title + left{title,items} + right{title,items} + conclusion',
     '- photo_text：title + subtitle + photoQuery(配图检索词，如 "咖啡 桌面")',
-    '- cta：title + action(引导语) + emoji',
+    '- cta：title + action(引导语)',
+    '',
+    '【文案品质要求 —— 每一条都要做到】',
+    '- 正文用 \\n\\n 分成 3-6 段，段间空一行；不要写成一整块连续文字',
+    '- 全文（含卡片）**不要出现任何 emoji**',
+    '- 不写"绝绝子/宝藏/yyds/赋能/抓手"这类词',
+    '- 至少给出 2 个具体可验证的结论（数字、判断标准、取舍代价）',
     '',
     '【最重要的要求】严格按下面这份 JSON 结构输出。',
     '每张卡片的文案字段必须**嵌套在 blocks 对象内**，不要平铺到卡片对象上。',
@@ -210,10 +235,61 @@ export async function composeDraft(opts: {
   return { draftId, title: draft.title, cards: cards.length, rendered };
 }
 
+/**
+ * 正文归一化。
+ *
+ * 三件事必须在落库前做掉，不能指望模型每次都守规矩：
+ *   1. **段落结构** —— 模型经常把整篇写成一大块没有空行的连续文字，
+ *      直接发到小红书就是一坨（第一次实发验证时踩到）。这里保证段间有空行。
+ *   2. **清 emoji** —— 正文进卡片渲染前也会被清，但库里存的应该是干净文本，
+ *      否则草稿页预览与实际发布内容不一致。
+ *   3. **剥掉正文里的话题标签** —— 话题是发布时用下拉框单独插入的，
+ *      正文再带一份就会重复。语料里的 `#品牌营销[话题]#` 是抓取时留下的标记，
+ *      模型会照着抄，必须在这里兜底。
+ */
+function normalizeBody(raw: string): string {
+  let cleaned = stripEmoji(raw).replace(/[ \t]+$/gm, '').trim();
+
+  // 正文里的话题标签一律去掉（含语料残留的 `[话题]#` 标记）
+  cleaned = cleaned
+    .replace(/(#[\p{Script=Han}\w]{1,20}\[话题\]#\s*)+$/gu, '')
+    .replace(/^\s*(#[\p{Script=Han}\w]{1,20}\s*){2,}$/gmu, '')
+    .replace(/([^\n])(\s*#[\p{Script=Han}\w]{1,20})(\s*#[\p{Script=Han}\w]{1,20})+/gu, '$1')
+    .trim();
+
+  const noTag = cleaned.replace(/[ \t]+$/gm, '').trim();
+
+  // 已经有空行分段就尊重原样
+  if (/\n\s*\n/.test(noTag)) {
+    return noTag.replace(/\n{3,}/g, '\n\n');
+  }
+
+  // 只有单换行：把换行当段落分隔，补成空行
+  if (noTag.includes('\n')) {
+    return noTag
+      .split(/\n+/)
+      .map((p) => p.trim())
+      .filter(Boolean)
+      .join('\n\n');
+  }
+
+  // 整篇一个自然段：按句末标点切分后每 2-3 句成段，交出可读的排版
+  const sentences = noTag.split(/(?<=[。！？!?])/).map((s) => s.trim()).filter(Boolean);
+  if (sentences.length <= 3) return noTag;
+
+  const target = Math.min(5, Math.max(3, Math.round(sentences.length / 3)));
+  const per = Math.ceil(sentences.length / target);
+  const paras: string[] = [];
+  for (let i = 0; i < sentences.length; i += per) {
+    paras.push(sentences.slice(i, i + per).join(''));
+  }
+  return paras.join('\n\n');
+}
+
 /** 模型偶尔不守 schema，这里硬兜底，保证下游渲染器拿到的形状永远是对的。 */
 function coerceDraft(raw: Draft): Draft {
   const title = String(raw.title ?? '').trim().slice(0, 20) || '未命名笔记';
-  const body = String(raw.body ?? '').trim().slice(0, 1000);
+  const body = normalizeBody(String(raw.body ?? '')).slice(0, 1000);
   const tags = Array.isArray(raw.tags) ? raw.tags.map((t) => String(t).replace(/^#/, '')).filter(Boolean) : [];
 
   let cards = Array.isArray(raw.cards) ? raw.cards : [];

@@ -2,7 +2,15 @@ import type { BrowserContext, Page } from 'playwright';
 import { browser, XHS_ORIGIN } from './browser.js';
 import { logger } from '../logger.js';
 import { logEvent } from '../db/index.js';
-import { throttle } from '../util/throttle.js';
+import {
+  PAUSE,
+  humanClick,
+  humanPause,
+  humanNudge,
+  humanReadNote,
+  humanScroll,
+  maybeDistracted,
+} from '../util/human.js';
 import type { ScrapedNote } from './scrape.js';
 
 /**
@@ -156,15 +164,21 @@ export async function harvestNoteList(
       timeout: 60_000,
     });
     await dismissLoginModal(page);
-    await page.waitForTimeout(2500);
+    await humanPause(PAUSE.readShort);
+    // 先像人一样看几眼首屏，再开始翻
+    await humanNudge(page);
 
     // 这里等的是**页面自己把下一页数据拉回来**，不是干等。
-    // 原来每次滚动都 throttle(6s)，40 轮下来光列表就要 5 分钟。
+    //
+    // ⚠️ 2026-10-10 之前这里是一步 `mouse.wheel(0, 3200)`：CDP 层面等价于
+    // 「瞬移 3200 像素、无中间帧、无停留、指针不动」。翻页本身很快，但
+    // 形状太干净了 —— 数据库里这一段的节奏是每 2.0 秒一篇、连续十几次不差毫秒。
+    // 现在改成拟人滚动：分格推进、每格停顿、偶尔回看、偶尔长停顿。
     let stagnant = 0;
     const MAX_ROUNDS = 80;
     for (let round = 0; round < MAX_ROUNDS && byId.size < max; round++) {
       const before = byId.size;
-      await page.mouse.wheel(0, 3200);
+      await humanScroll(page, { distance: 600 + Math.random() * 1100 });
 
       // 等新数据出现：要么数量涨了，要么确认到底了
       const grew = await waitFor(
@@ -189,9 +203,9 @@ export async function harvestNoteList(
         stagnant = 0;
       }
 
+      // 翻几屏就分神一次，让整体节奏有长尾
+      await maybeDistracted();
       onProgress?.(byId.size);
-      // 滚动节奏本身就有随机性，不必再叠加固定延迟。
-      // 真要给风控让路，靠并发度而不是每步 sleep。
     }
 
     // 作者资料兜底：从主页的 __INITIAL_STATE__ 里取
@@ -275,60 +289,169 @@ interface DomNote {
 }
 
 /**
- * 笔记读取器：**复用同一个标签页**。
+ * 笔记读取器。
  *
- * 原来每篇笔记都 newPage → goto → 固定睡 3.5s → close，
- * 一篇 8~10 秒，150 篇就是二十多分钟，全花在开关标签页和干等上。
- * 现在标签页常驻，且改成「等数据真的出现」而不是「睡够 3.5 秒」。
+ * ⚠️ 2026-10-10 风控处置之后这里改了思路。
+ *
+ * 老做法：`goto /explore/<id>` → 读 → 下一篇 `goto`，每篇之间固定间隔。
+ * 结果是数据库里的形状非常干净 —— **每篇恰好 2.0 秒**，连续十几篇不差毫秒。
+ * 真人绝不会对每一篇都花一样的时间，这个等距节奏就是最直接的机器签名。
+ *
+ * 新做法分两层：
+ *  1. 优先**从主页网格里点开**笔记（真人就是这么看的：划过卡片 → 点进去 →
+ *     看完退回来 → 点下一张）。点击、还原、再点击，天然带上非等距的节奏，
+ *     referrer 也是主页而不是凭空冒出来的详情页。
+ *  2. 每篇之间按**内容长度**停留（长文看得久），再叠加对数正态抖动，
+ *     并偶尔插入一次长「走神」停顿。
+ *
+ * 网格里找不到卡片时才退回直接导航 —— 功能和稳定性不能丢。
  */
 export interface NoteReader {
   read(noteId: string, xsecToken: string | null): Promise<DomNote | null>;
   close(): Promise<void>;
 }
 
-export async function createNoteReader(): Promise<NoteReader> {
+/** 在主页网格里把某篇笔记的卡片滚进视野。找不到返回 null。 */
+async function findCard(page: Page, noteId: string): Promise<ReturnType<Page['locator']> | null> {
+  const sel = `a[href*="/explore/${noteId}"]`;
+  for (let round = 0; round < 12; round++) {
+    const loc = page.locator(sel).first();
+    if ((await loc.count().catch(() => 0)) > 0) {
+      const visible = await loc.isVisible().catch(() => false);
+      if (visible) return loc;
+    }
+    // 卡片还没进 DOM（懒加载）或还在视口外，往下翻一点再找
+    await humanScroll(page, { distance: 320 + Math.random() * 480, jiggle: false });
+  }
+  return null;
+}
+
+/** 关掉笔记详情浮层，回到主页网格。 */
+async function closeNoteOverlay(page: Page, profileUrl: string): Promise<void> {
+  for (const sel of [
+    '.note-detail-mask',
+    '.close-circle',
+    '.note-detail .close',
+    '[class*="close"][class*="circle"]',
+    '[aria-label="close"]',
+  ]) {
+    const loc = page.locator(sel).first();
+    if ((await loc.count().catch(() => 0)) > 0 && (await loc.isVisible().catch(() => false))) {
+      await loc.click({ timeout: 2500 }).catch(() => undefined);
+      // 关掉浮层之后网格要恢复一下（滚动位置回弹、卡片重新可见），
+      // 立刻去点下一张会点空
+      await humanPause(PAUSE.settle);
+      break;
+    }
+  }
+
+  // 兜底：关不掉就直接回主页。这比留在浮层里继续疯点干净。
+  if (!page.url().includes('/user/profile/')) {
+    await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => undefined);
+    await humanPause(PAUSE.glide);
+  }
+}
+
+/**
+ * @param userId 给了就走「主页点开」的拟人路径；不给（页面已经不在主页时）退回直接导航。
+ */
+export async function createNoteReader(userId?: string): Promise<NoteReader> {
   const ctx = await browser.ensureLaunched();
   const page = await ctx.newPage();
 
+  const profileUrl = userId ? `${XHS_ORIGIN}/user/profile/${userId}` : null;
+  let gridReady = false;
+
+  if (profileUrl) {
+    try {
+      await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      await dismissLoginModal(page);
+      await humanPause(PAUSE.readShort);
+      await humanNudge(page);
+      gridReady = true;
+      logger.info('笔记读取走「主页点开」拟人路径');
+    } catch (err) {
+      logger.warn({ err }, '打开主页失败，退回直接导航读笔记');
+    }
+  }
+
+  /** 直接导航读一篇（兜底路径）。 */
+  async function readByNavigation(noteId: string, xsecToken: string | null): Promise<DomNote | null> {
+    const qs = xsecToken
+      ? `?xsec_token=${encodeURIComponent(xsecToken)}&xsec_source=pc_user`
+      : '';
+    await page.goto(`${XHS_ORIGIN}/explore/${noteId}${qs}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 45_000,
+    });
+    await dismissLoginModal(page);
+    return extractCurrent(page);
+  }
+
+  async function extractCurrent(p: Page): Promise<DomNote | null> {
+    await waitFor(() => hasNoteData(p), { timeout: 12_000, interval: 150 });
+    const data = (await p.evaluate(EXTRACT_NOTE)) as ExtractNoteOk | ExtractNoteMissing;
+
+    if (!data.ok) {
+      if (data.throttled) {
+        throw new RATE_LIMITED(
+          '小红书判定为访问过于频繁（300013），已停止抓取。等一段时间再试，' +
+            '或者把「最多篇数」调小、分批抓取。',
+        );
+      }
+      return null;
+    }
+
+    return {
+      title: data.title || '',
+      desc: data.desc || '',
+      tags: [...new Set(data.tags ?? [])],
+      images: [...new Set(data.images ?? [])],
+      publishedAt: data.time ?? null,
+      liked: data.liked ?? 0,
+      collected: data.collected ?? 0,
+      comment: data.comment ?? 0,
+    };
+  }
+
   return {
     async read(noteId: string, xsecToken: string | null): Promise<DomNote | null> {
-      const qs = xsecToken
-        ? `?xsec_token=${encodeURIComponent(xsecToken)}&xsec_source=pc_user`
-        : '';
-      await page.goto(`${XHS_ORIGIN}/explore/${noteId}${qs}`, {
-        waitUntil: 'domcontentloaded',
-        timeout: 45_000,
-      });
-      await dismissLoginModal(page);
+      // 点开之前先停一下 —— 六十多篇连着点、每篇间隔都一样，才是被识别的根源
+      await humanPause(PAUSE.shift);
 
-      // 等正文真的渲染出来，而不是固定睡几秒赌它够了。
-      // 有 xsec_token 时通常 1 秒内就有 __INITIAL_STATE__。
-      await waitFor(() => hasNoteData(page), { timeout: 12_000, interval: 150 });
+      let note: DomNote | null = null;
 
-      const data = (await page.evaluate(EXTRACT_NOTE)) as
-        | ExtractNoteOk
-        | ExtractNoteMissing;
+      if (gridReady && profileUrl) {
+        try {
+          const card = await findCard(page, noteId);
+          if (card) {
+            await humanClick(page, card);
+            // 浮层里的数据要等它自己渲染
+            note = await extractCurrent(page);
 
-      if (!data.ok) {
-        if (data.throttled) {
-          throw new RATE_LIMITED(
-            '小红书判定为访问过于频繁（300013），已停止抓取。等一段时间再试，' +
-              '或者把「最多篇数」调小、分批抓取。',
-          );
+            // ⚠️ 停留时长按内容算，不是固定值。
+            // 「每篇 2.0 秒」是上一轮被判定的直接证据，必须打散。
+            const chars = (note?.title.length ?? 0) + (note?.desc.length ?? 0);
+            await humanReadNote(page, chars);
+            if (Math.random() < 0.2) await maybeDistracted();
+
+            await closeNoteOverlay(page, profileUrl);
+            return note;
+          }
+          logger.debug({ noteId }, '网格里没找到卡片，退回直接导航');
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (err instanceof RATE_LIMITED) throw err;
+          logger.warn({ err: msg, noteId }, '主页点开失败，退回直接导航');
+          // 浮层可能还开着，收拾干净再走
+          await closeNoteOverlay(page, profileUrl).catch(() => undefined);
         }
-        return null;
       }
 
-      return {
-        title: data.title || '',
-        desc: data.desc || '',
-        tags: [...new Set(data.tags ?? [])],
-        images: [...new Set(data.images ?? [])],
-        publishedAt: data.time ?? null,
-        liked: data.liked ?? 0,
-        collected: data.collected ?? 0,
-        comment: data.comment ?? 0,
-      };
+      note = await readByNavigation(noteId, xsecToken);
+      const chars = (note?.title.length ?? 0) + (note?.desc.length ?? 0);
+      await humanReadNote(page, chars);
+      return note;
     },
 
     async close() {
@@ -473,7 +596,6 @@ export async function readNotePage(
     await reader.close();
   }
 }
-
 /** DOM 读到的数据转成统一的笔记结构 */
 export function toScrapedNote(
   base: { noteId: string; xsecToken: string | null },

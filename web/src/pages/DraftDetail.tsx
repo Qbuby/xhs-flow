@@ -129,8 +129,16 @@ export function DraftDetail() {
         </div>
       )}
       {draft.published_url && (
-        <div className="rounded-lg bg-emerald-50 border border-emerald-200 px-4 py-3 text-sm text-emerald-700 mb-4">
-          已发布于 {draft.published_at}
+        <div className="rounded-lg bg-emerald-50 border border-emerald-200 px-4 py-3 text-sm text-emerald-700 mb-4 flex items-center gap-3">
+          <span>已发布于 {draft.published_at}</span>
+          <a
+            href={draft.published_url}
+            target="_blank"
+            rel="noreferrer"
+            className="underline hover:no-underline"
+          >
+            打开笔记 ↗
+          </a>
         </div>
       )}
 

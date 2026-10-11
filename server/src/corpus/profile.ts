@@ -100,6 +100,11 @@ const PROFILE_SYSTEM = `你是一位视觉设计总监 + 小红书内容策略�
 - accent_style / decoration / background_image 必须从给定枚举里选
 如果这个博主的风格本身不适合做成卡片，选一个接近的并保持诚实。
 
+设计取向：卡片走**克制、精致、有设计感**的路线。
+- decoration 优先选 none / dots / corner_mark，**不要选 emoji** —— emoji 是彩色位图字体，
+  跟卡片的字重和配色不统一，会把版面拉廉价。
+- 版式留白要够，字号层级要拉开（标题显著大于正文），不要靠堆元素制造信息量。
+
 其余字段要求具体、可复用，忌空话。所有判断都必须能追溯到下面的样稿证据。`;
 
 function hexOr(value: string, fallback: string): string {
@@ -120,6 +125,10 @@ function sanitizeSpec(spec: CardTemplateSpec): CardTemplateSpec {
     line_height: clamp(spec.line_height, 1.2, 2.2),
     radius: clamp(spec.radius, 0, 48),
     text_ratio: clamp(spec.text_ratio, 0.1, 0.95),
+    // emoji 是彩色位图字体，跟卡片的字重、配色对不上，会把版面拉廉价。
+    // 这里强制换掉，哪怕画像里选了 emoji（visual.emoji_as_decoration 仍如实保留，
+    // 那是对原作者的客观描述，供参考）。
+    decoration: spec.decoration === 'emoji' ? 'none' : spec.decoration,
   };
 }
 

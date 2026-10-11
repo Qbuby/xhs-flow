@@ -211,6 +211,57 @@ export function Dashboard() {
           </div>
         )}
 
+        {/* 防风控余量：账号被处置过一次之后，这个必须随时可见 */}
+        {health?.risk && (
+          <div className="mt-5 pt-5 border-t border-ink-100">
+            {health.risk.cooldown.active && (
+              <div className="rounded-lg bg-rose-50 border border-rose-300 px-4 py-3 text-sm text-rose-800 mb-4">
+                <div className="font-medium mb-1">⏸ 账号处置冷静期</div>
+                <div className="text-xs leading-relaxed">
+                  至 {health.risk.cooldown.untilLocal ?? health.risk.cooldown.until?.slice(0, 16).replace('T', ' ')}
+                  （还有约 {health.risk.cooldown.leftHours} 小时）。此期间不执行任何自动任务，
+                  手动抓取/发布也会被拒绝 —— 处置期内继续访问只会继续累积风控记录。
+                  到「设置 → 处置冷静期」可以提前解除。
+                </div>
+              </div>
+            )}
+            <div className="flex items-baseline justify-between mb-2">
+              <div className="text-xs text-ink-500">
+                今日防风控额度
+                <span className="ml-2 text-ink-300">
+                  （安静时段 {health.risk.quietHours}
+                  {health.risk.inQuietHours ? ' · 进行中' : ''} · 浏览器：
+                  {health.risk.useRealChrome ? '本机 Chrome' : 'Playwright Chromium'}）
+                </span>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              {health.risk.budget.map((b) => {
+                const label = { scrape: '抓取', publish: '发布', healthcheck: '会话探活', login: '登录' }[b.kind];
+                return (
+                  <div key={b.kind} className="rounded-lg bg-ink-50 px-3 py-2.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs text-ink-500">{label}</span>
+                      <span className={`text-xs font-medium tabular-nums ${b.used >= b.limit ? 'text-rose-600' : 'text-ink-700'}`}>
+                        {b.used}/{b.limit}
+                      </span>
+                    </div>
+                    <div className="mt-1.5 h-1 rounded-full bg-ink-200 overflow-hidden">
+                      <div
+                        className={`h-full rounded-full ${b.used >= b.limit ? 'bg-rose-500' : 'bg-emerald-500'}`}
+                        style={{ width: `${Math.min(100, (b.used / b.limit) * 100)}%` }}
+                      />
+                    </div>
+                    {b.waitMin ? (
+                      <div className="text-[10px] text-amber-600 mt-1">还差 {b.waitMin} 分钟</div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {qr ? (
           <div className="mt-5 pt-5 border-t border-ink-100 flex items-center gap-5">
             <img src={qr} alt="登录二维码" className="w-40 h-40 rounded-lg border border-ink-200" />
