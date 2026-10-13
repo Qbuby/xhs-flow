@@ -56,13 +56,29 @@ export function cjkRatio(s: string): number {
   return cjk / [...s].length;
 }
 
-/** 非常朴素的 emoji 识别，覆盖小红书文案里的高频区间。 */
+/**
+ * 真正的 emoji 区间。
+ *
+ * ⚠️ 这里必须**精确**，不能用「看着像符号就删」的宽区间。
+ * 旧实现把 `\u{2600}-\u{27BF}`（杂项符号）、`\u{2B00}-\u{2BFF}`、`\u{2190}-\u{21FF}`
+ * （箭头）、`\u{2460}-\u{24FF}`（带圈数字 ①-⑳）一起删了，结果是：
+ *
+ *   - pipeline.ts 的 prompt 明确允许「用 ①②③ 和「」做结构标记」，
+ *     但卡片上 ①②③ 会被静默删掉，只留两个空格
+ *   - 作者有意放的 ❌ / ✓ / ★ / → / ↓ 全部消失，版面出现莫名空白
+ *
+ * 现在改成白名单制：只删彩色 emoji 本体及其配套修饰符，
+ * 单色几何符号与带圈数字一律保留（它们走文字字体渲染，不会破坏字重与配色）。
+ */
+const EMOJI_CORE =
+  /[\u{1F000}-\u{1FAFF}\u{1F900}-\u{1F9FF}\u{FE0F}\u{200D}\u{20E3}\u{1F3FB}-\u{1F3FF}]/gu;
+
+/** 只有真正成对的符号才当 emoji 删 —— 单色变体（U+FE0E）保留。 */
+const EMOJI_TEXT_STYLE = /\uFE0E/gu;
+
+/** 非常朴素的 emoji 计数，与 stripEmoji 的判定保持一致。 */
 export function countEmoji(s: string): number {
-  return (
-    s.match(
-      /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}]/gu,
-    )?.length ?? 0
-  );
+  return s.match(EMOJI_CORE)?.length ?? 0;
 }
 
 /**
@@ -72,13 +88,20 @@ export function countEmoji(s: string): number {
  * emoji 在 Chromium 里走彩色位图字体，跟卡片配色和字重完全不搭，
  * 一出现就破坏整张版面的统一感；而且不同语料库的 emoji 密度差很多，
  * 只靠 prompt 拦不住。放进这里兜底，任何来源的文案进卡片前都会被清一遍。
+ *
+ * 反向约束见 EMOJI_CORE 的注释：**不删** ①②③、→、★、✓、❌、●、◆、▲ 这类
+ * 单色几何/带圈字符 —— prompt 允许它们，渲染也正常。
  */
 export function stripEmoji(s: string): string {
   return s
-    .replace(
-      /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{2190}-\u{21FF}\u{2460}-\u{24FF}\u{FE0F}\u{200D}\u{20E3}\u{1F3FB}-\u{1F3FF}]/gu,
-      '',
-    )
+    .replace(EMOJI_CORE, '')
+    // 零宽连接符残留（emoji 序列被拆掉后可能留下孤立的 ZWJ）
+    .replace(/\u200D/g, '')
+    // 数字键帽的包围框
+    .replace(/[\u20E3]/g, '')
+    // 变体选择符残留
+    .replace(/[\uFE0E\uFE0F]/g, '')
+    .replace(EMOJI_TEXT_STYLE, '')
     .replace(/[ \t]{2,}/g, ' ')
     .replace(/ +\n/g, '\n');
 }

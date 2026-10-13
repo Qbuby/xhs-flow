@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { api, type NoteRow, type Topic, mediaUrl, fmtDate, fmtNum } from '../api';
+import { api, type NoteRow, type Topic, mediaUrl, fmtDate, fmtNum, exportCorpus } from '../api';
 import { Card, SectionTitle, StatusBadge, Spinner, Empty, Stat } from '../components';
 import { toast } from '../store';
 import { partsToCron, describeNext } from '../util/schedule';
+import { useDraftValue } from '../useDraftValue';
 
 interface Detail {
   source: {
@@ -21,6 +22,7 @@ interface Detail {
   notes: NoteRow[];
   styleProfile: StyleProfile | null;
   cardSpec: Record<string, unknown>;
+  design: DesignInfo | null;
 }
 
 interface StyleProfile {
@@ -37,15 +39,37 @@ interface StyleProfile {
     cover_patterns: string[];
     palette_summary: string;
   };
+  /**
+   * 新形状是设计契约（theme / palette_index / type_scale / density / texture /
+   * motifs / accent_style）—— 具体颜色与字号由服务端解析，前端不再自己读 hex。
+   * 库里可能还有旧画像，所以这里只做「可选读」。
+   */
   card_template_spec: {
-    palette: string[];
-    background: string;
-    accent: string;
-    title_size: number;
+    theme?: string;
+    palette_index?: number;
+    type_scale?: string;
+    density?: string;
+    texture?: string;
+    motifs?: string[];
+    accent_style?: string;
   };
   do_list: string[];
   dont_list: string[];
   topic_map: Array<{ topic: string; note_count: number; avg_liked: number }>;
+}
+
+/** 服务端 `/api/sources/:id` 解析好的设计规格（含真实色值）。 */
+interface DesignInfo {
+  theme: string;
+  paletteName: string;
+  texture: string;
+  motifs: string[];
+  accentStyle: string;
+  typeScale: string;
+  density: string;
+  bg?: string;
+  ink?: string;
+  accent?: string;
 }
 
 interface NoteDetail {
@@ -64,7 +88,9 @@ export function SourceDetail() {
   const [running, setRunning] = useState<string | null>(null);
   const [hint, setHint] = useState<string | null>(null);
   const [batch, setBatch] = useState(30);
-  const [autoOn, setAutoOn] = useState(false);
+  // 轮询每 12 秒刷新，用户刚点开开关会被下一次 load 冲回去
+  const draftAutoOn = useDraftValue(false);
+  const [exporting, setExporting] = useState(false);
   const [reCron, setReCron] = useState('04:00');
   const [reFreq, setReFreq] = useState<'daily' | 'weekly' | 'hourly'>('daily');
   const [reDays, setReDays] = useState<number[]>([1, 2, 3, 4, 5, 6, 7]);
@@ -77,7 +103,7 @@ export function SourceDetail() {
         api.get<Topic[]>(`/api/sources/${id}/topics`),
       ]);
       setData(d);
-      setAutoOn(Boolean(d.source.auto_scrape));
+      draftAutoOn.onChange(Boolean(d.source.auto_scrape));
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'err');
     } finally {
@@ -108,15 +134,29 @@ export function SourceDetail() {
     }
   }
 
+  /** 导出这位作者的语料（笔记 + 图片 + 蒸馏 + 画像 + 选题），供导入其他设备。 */
+  async function exportThis() {
+    if (!id) return;
+    setExporting(true);
+    try {
+      await exportCorpus(Number(id));
+      toast('已导出并开始下载');
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), 'err');
+    } finally {
+      setExporting(false);
+    }
+  }
+
   async function toggleAuto() {
-    const next = !autoOn;
+    const next = !draftAutoOn.value;
     try {
       await api.post(`/api/sources/${id}/auto`, { enabled: next });
       await api.post('/api/settings', {
         scheduleRescrape: partsToCron({ time: reCron, freq: reFreq, days: reDays, everyNHours: 6 }),
         rescrapeBatch: batch,
       });
-      setAutoOn(next);
+      draftAutoOn.onChange(next);
       toast(next ? '已开启自动续抓' : '已关闭自动续抓');
       void load();
     } catch (err) {
@@ -176,6 +216,7 @@ export function SourceDetail() {
   if (!data) return <Empty>加载失败</Empty>;
 
   const p = data.styleProfile;
+  const design = data.design;
 
   return (
     <div>
@@ -190,6 +231,14 @@ export function SourceDetail() {
         desc={`${data.source.profile_url} · 最近抓取 ${data.source.last_scraped_at ?? '从未'}`}
         action={
           <div className="flex gap-2">
+            <button
+              className="btn-ghost"
+              disabled={exporting}
+              onClick={() => void exportThis()}
+              title="导出这位作者的语料（笔记、图片、蒸馏、画像、选题），供导入到其他设备"
+            >
+              {exporting ? '打包中…' : '导出该作者'}
+            </button>
             <button
               className="btn-ghost"
               disabled={busy === 'distill' || running === 'distill'}
@@ -304,12 +353,15 @@ export function SourceDetail() {
               />
             )}
           </div>
-          <button className={autoOn ? 'btn-primary' : 'btn-ghost'} onClick={() => void toggleAuto()}>
-            {autoOn ? '已开启' : '开启'}
+          <button
+            className={draftAutoOn.value ? 'btn-primary' : 'btn-ghost'}
+            onClick={() => void toggleAuto()}
+          >
+            {draftAutoOn.value ? '已开启' : '开启'}
           </button>
         </div>
 
-        {autoOn && (
+        {draftAutoOn.value && (
           <p className="text-[11px] text-ink-400 mt-2">
             开启后每天会自动补抓 {batch} 篇。数量建议保守 —— 抓得太密容易触发小红书限流。
           </p>
@@ -323,20 +375,30 @@ export function SourceDetail() {
 
           <div className="grid md:grid-cols-3 gap-5 mb-5">
             <div>
-              <h4 className="text-xs font-semibold text-ink-500 mb-2">配色规格</h4>
+              <h4 className="text-xs font-semibold text-ink-500 mb-2">设计规格</h4>
               <div className="flex gap-1.5 mb-2">
-                {p.card_template_spec.palette.map((c) => (
-                  <div
-                    key={c}
-                    className="w-9 h-9 rounded-md border border-ink-200"
-                    style={{ background: c }}
-                    title={c}
-                  />
-                ))}
+                {[design?.bg, design?.ink, design?.accent]
+                  .filter((c): c is string => Boolean(c))
+                  .map((c) => (
+                    <div
+                      key={c}
+                      className="w-9 h-9 rounded-md border border-ink-200"
+                      style={{ background: c }}
+                      title={c}
+                    />
+                  ))}
               </div>
-              <div className="text-[11px] text-ink-500">
-                背景 {p.card_template_spec.background} · 强调 {p.card_template_spec.accent} · 标题{' '}
-                {p.card_template_spec.title_size}px
+              <div className="text-[11px] text-ink-500 leading-relaxed">
+                {design ? (
+                  <>
+                    {design.theme} · 色板 {design.paletteName} · 字号 {design.typeScale} · 密度{' '}
+                    {design.density}
+                    <br />
+                    纹理 {design.texture} · 装饰 {design.motifs.join('/')} · 强调 {design.accentStyle}
+                  </>
+                ) : (
+                  '尚未生成'
+                )}
               </div>
               <h4 className="text-xs font-semibold text-ink-500 mt-4 mb-1.5">图片版式</h4>
               <div className="text-xs text-ink-600">{p.visual.dominant_layouts.join(' / ')}</div>

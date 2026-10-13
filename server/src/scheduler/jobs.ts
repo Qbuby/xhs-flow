@@ -7,9 +7,8 @@ import { browser } from '../xhs/browser.js';
 import { analyzeSource } from '../corpus/analyze.js';
 import { buildStyleProfile } from '../corpus/profile.js';
 import { composeNextDraft, ideateTopics, renderDraftCards } from '../generate/pipeline.js';
-import { approvedDrafts, markPublishing, markPublishResult, publishNote } from '../xhs/publish.js';
 import { logNormalDelay, sleep } from '../util/throttle.js';
-import { enforceBrowse, browseGate, noteBrowseStart, quietHoursNow } from '../util/human.js';
+import { browseGate, quietHoursNow } from '../util/human.js';
 
 /**
  * 任务调度。
@@ -25,7 +24,6 @@ export type JobType =
   | 'ideate'
   | 'compose'
   | 'render'
-  | 'publish'
   | 'healthcheck';
 
 export interface JobPayload {
@@ -131,76 +129,6 @@ const handlers: Record<JobType, Handler> = {
     const row = get<{ source_id: number | null }>('SELECT source_id FROM drafts WHERE id = ?', p.draftId);
     const n = await renderDraftCards(p.draftId, row?.source_id ?? null);
     return { rendered: n };
-  },
-
-  async publish() {
-    const queue = approvedDrafts();
-    if (queue.length === 0) return { published: 0 };
-
-    // 自动发布要过额度与安静时段。一次自动发布就是一次完整的创作中心会话，
-    // 一天里反复进出创作中心是最容易被判定为「非真人运营」的行为之一。
-    //
-    // 闸门按**会话**过：这里过一次（并记一次额度），循环里每篇带 inSession
-    // 进去 —— 否则第二条会被「发布最小间隔 20 分钟」挡住，而真人打开创作中心
-    // 发两条笔记就是一次访问。
-    const gate = enforceBrowse('publish', { auto: true });
-    if (!gate.ok) {
-      logEvent('risk', `自动发布已推迟：${gate.reason}`, { severity: 'warn' });
-      return { published: [], deferred: gate.reason };
-    }
-    noteBrowseStart('publish');
-
-    const published: number[] = [];
-    const failed: Array<{ id: number; error: string }> = [];
-
-    for (const { id } of queue) {
-      markPublishing(id);
-      const draft = get<{
-        id: number;
-        title: string;
-        body: string;
-        tags: string;
-        source_id: number | null;
-      }>('SELECT id, title, body, tags, source_id FROM drafts WHERE id = ?', id);
-
-      if (!draft) continue;
-
-      const cards = all<{ image_path: string | null }>(
-        'SELECT image_path FROM draft_cards WHERE draft_id = ? AND image_path IS NOT NULL ORDER BY idx',
-        id,
-      );
-      const imagePaths = cards.map((c) => c.image_path as string);
-
-      const result = await publishNote({
-        draftId: id,
-        title: draft.title,
-        body: draft.body,
-        tags: JSON.parse(draft.tags || '[]'),
-        imagePaths,
-        // 闸门与计数已经在循环外按会话做过一次
-        inSession: true,
-      });
-
-      markPublishResult(id, result.ok, result.noteUrl, result.error);
-
-      if (result.ok) {
-        published.push(id);
-        logger.info({ draftId: id }, '发布成功');
-        // 成功后清理本地图片，省磁盘
-        await cleanupDraftMedia(id);
-      } else {
-        failed.push({ id, error: result.error ?? '未知' });
-        logEvent('publish', `草稿 ${id} 发布失败：${result.error}`, { severity: 'error' });
-      }
-
-      // 发布间隔是硬性防风控，不能省；而且不能是固定值 ——
-      // 固定 45 秒连发在风控眼里仍然是机器。这里改成对数正态抖动。
-      if (queue.length > 1) {
-        await sleep(logNormalDelay(config.publish.intervalSec * 1000, 0.45));
-      }
-    }
-
-    return { published, failed };
   },
 
   async healthcheck() {
@@ -401,18 +329,6 @@ function activeSourceIds(): number[] {
   return all<{ id: number }>(`SELECT id FROM sources WHERE status = 'active' ORDER BY id`).map((r) => r.id);
 }
 
-/**
- * 自动发布是否开启。
- *
- * 以设置表为准：界面上那个开关写的就是 `auto_publish`，
- * 而 `config.publish.auto` 只来自 .env 的默认值。两处都看的话
- * 会出现「界面上关了但定时任务照发」这种最不该有的不一致。
- */
-export function autoPublishEnabled(): boolean {
-  const raw = getSetting('auto_publish');
-  return raw === undefined || raw === '' ? config.publish.auto : raw === 'true';
-}
-
 /* ------------------------------------------------------------------ */
 /* 会话健康检查的「非定周期」排程                                        */
 /* ------------------------------------------------------------------ */
@@ -522,18 +438,6 @@ export function startScheduler(): void {
     },
   );
 
-  // 定时发布：只有开了自动发布才真正入队。
-  //
-  // 两处都改用设置表里的值：原来这里读的是 config（.env），而界面上开关写的是
-  // settings.auto_publish —— 也就是说「在界面上打开自动发布」根本不生效。
-  scheduleCron('publish', getSetting('schedule_publish') ?? config.schedule.publish, () => {
-    if (!autoPublishEnabled()) {
-      logger.info('自动发布未开启，跳过');
-      return;
-    }
-    enqueue('publish', {}, { dedupeKey: 'publish:tick' });
-  });
-
   // 会话健康检查：web_session 服务端会悄悄过期，早点发现好过发布失败才发现。
   //
   // ⚠️ 原来是严格「每 17 分钟一次」。数据库里的间隔直方图是 17/17/17/9/17/17…，
@@ -558,8 +462,6 @@ export function schedulerInfo() {
   return {
     running: !stopped,
     generate: getSetting('schedule_generate') ?? config.schedule.generate,
-    publish: getSetting('schedule_publish') ?? config.schedule.publish,
-    autoPublish: autoPublishEnabled(),
     pending: get<{ c: number }>(`SELECT COUNT(*) AS c FROM jobs WHERE status='pending'`)?.c ?? 0,
     running_jobs: get<{ c: number }>(`SELECT COUNT(*) AS c FROM jobs WHERE status='running'`)?.c ?? 0,
     failed: get<{ c: number }>(`SELECT COUNT(*) AS c FROM jobs WHERE status='failed'`)?.c ?? 0,

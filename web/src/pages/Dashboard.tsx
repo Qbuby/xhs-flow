@@ -347,7 +347,7 @@ export function Dashboard() {
         <Stat
           label="已发布"
           value={published}
-          hint={health?.scheduler.autoPublish ? '自动发布已开' : '手动发布'}
+          hint="发布已改为手动"
         />
       </div>
 

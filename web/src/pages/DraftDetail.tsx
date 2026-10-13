@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { api, type Draft, type DraftCard, mediaUrl } from '../api';
 import { Card, SectionTitle, StatusBadge, Spinner, Empty } from '../components';
+import { useDraftValue } from '../useDraftValue';
 import { toast } from '../store';
 
 export function DraftDetail() {
@@ -11,9 +12,15 @@ export function DraftDetail() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState('');
   const [editing, setEditing] = useState(false);
-  const [title, setTitle] = useState('');
-  const [body, setBody] = useState('');
-  const [tags, setTags] = useState('');
+
+  // 标题/正文/标签都是大段文字，编辑时不能被任何自动 load 冲掉。
+  // 本页虽然没有轮询，但 rerender() 之后 8 秒会自动 load 一次，
+  // 那时用户可能正在改文案 —— 同一类问题，同样用 useDraftValue 兜住。
+  const draftTitle = useDraftValue(draft?.title ?? '');
+  const draftBody = useDraftValue(draft?.body ?? '');
+  const draftTags = useDraftValue(
+    JSON.parse(draft?.tags || '[]').join(' '),
+  );
 
   async function load() {
     if (!id) return;
@@ -21,9 +28,6 @@ export function DraftDetail() {
       const res = await api.get<{ draft: Draft; cards: DraftCard[] }>(`/api/drafts/${id}`);
       setDraft(res.draft);
       setCards(res.cards);
-      setTitle(res.draft.title);
-      setBody(res.draft.body);
-      setTags(JSON.parse(res.draft.tags || '[]').join(' '));
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'err');
     } finally {
@@ -52,12 +56,15 @@ export function DraftDetail() {
     setBusy('save');
     try {
       await api.post(`/api/drafts/${id}/edit`, {
-        title,
-        body,
-        tags: tags.split(/\s+/).filter(Boolean),
+        title: draftTitle.value,
+        body: draftBody.value,
+        tags: draftTags.value.split(/\s+/).filter(Boolean),
       });
       toast('已保存');
       setEditing(false);
+      draftTitle.commit();
+      draftBody.commit();
+      draftTags.commit();
       void load();
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'err');
@@ -101,7 +108,19 @@ export function DraftDetail() {
             <StatusBadge status={draft.status} />
             {!isFinal && (
               <>
-                <button className="btn-ghost" onClick={() => setEditing((v) => !v)}>
+                <button
+                  className="btn-ghost"
+                  onClick={() => {
+                    // 取消编辑 = 放弃改动。必须显式 reset：onBlur 现在不再
+                    // 把值擦回服务器（那会吃掉「保存」），所以改过的字会
+                    // 一直留在 draft 里，不 reset 的话下次点「编辑文案」
+                    // 看到的还是上一次的脏值。
+                    draftTitle.reset();
+                    draftBody.reset();
+                    draftTags.reset();
+                    setEditing(false);
+                  }}
+                >
                   {editing ? '取消编辑' : '编辑文案'}
                 </button>
                 <button className="btn-ghost" disabled={busy === 'render'} onClick={() => void rerender()}>
@@ -145,11 +164,11 @@ export function DraftDetail() {
       {editing ? (
         <Card className="mb-5">
           <label className="label">标题（20 字以内）</label>
-          <input className="input mb-3" value={title} maxLength={40} onChange={(e) => setTitle(e.target.value)} />
+          <input className="input mb-3" value={draftTitle.value} maxLength={40} onChange={(e) => draftTitle.onChange(e.target.value)} />
           <label className="label">正文</label>
-          <textarea className="input h-64 mb-3" value={body} onChange={(e) => setBody(e.target.value)} />
+          <textarea className="input h-64 mb-3" value={draftBody.value} onChange={(e) => draftBody.onChange(e.target.value)} />
           <label className="label">话题标签（空格分隔）</label>
-          <input className="input mb-4" value={tags} onChange={(e) => setTags(e.target.value)} />
+          <input className="input mb-4" value={draftTags.value} onChange={(e) => draftTags.onChange(e.target.value)} />
           <div className="flex gap-2">
             <button className="btn-primary" disabled={busy === 'save'} onClick={() => void save()}>
               {busy === 'save' ? '保存中…' : '保存'}

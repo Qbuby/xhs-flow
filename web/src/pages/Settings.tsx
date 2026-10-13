@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, type Health, type EventRow, type JobRow } from '../api';
 import { Card, SectionTitle, Dot, Spinner, StatusBadge, Empty } from '../components';
+import { useDraftValue } from '../useDraftValue';
 import { toast } from '../store';
 
 interface Settings {
@@ -15,8 +16,6 @@ interface Settings {
   };
   schedule: {
     generate: string;
-    publish: string;
-    autoPublish: boolean;
     autoCompose: boolean;
     autoIdeate: boolean;
     composePerRun: number;
@@ -32,19 +31,22 @@ export function Settings() {
   const [health, setHealth] = useState<Health | null>(null);
   const [events, setEvents] = useState<EventRow[]>([]);
   const [jobs, setJobs] = useState<JobRow[]>([]);
-  const [brand, setBrand] = useState('');
-  const [generate, setGenerate] = useState('');
-  const [publish, setPublish] = useState('');
   const [checking, setChecking] = useState('');
   const [busy, setBusy] = useState('');
   const [result, setResult] = useState<string>('');
-  const [pauseUntil, setPauseUntil] = useState('');
-  const [llmApi, setLlmApi] = useState<'openai' | 'anthropic'>('anthropic');
-  const [llmBase, setLlmBase] = useState('');
   const [llmModel, setLlmModel] = useState('');
   const [llmKey, setLlmKey] = useState('');
   const [keyMasked, setKeyMasked] = useState('');
   const [fromEnv, setFromEnv] = useState(false);
+
+  // 这些输入框在轮询页面上，用户改到一半会被下一次 load() 冲掉，
+  // 所以走 useDraftValue：编辑中不被覆盖，失焦才回归服务器值。
+  const draftBrand = useDraftValue(settings?.brand ?? '');
+  const draftGenerate = useDraftValue(settings?.schedule.generate ?? '');
+  const draftPauseUntil = useDraftValue(settings?.schedule.pauseUntil ?? '');
+  const draftLlmApi = useDraftValue<'openai' | 'anthropic'>(settings?.llm.api ?? 'anthropic');
+  const draftLlmBase = useDraftValue(settings?.llm.baseURL ?? '');
+  const draftLlmModel = useDraftValue(settings?.llm.model ?? '');
 
   async function load() {
     try {
@@ -55,20 +57,9 @@ export function Settings() {
         api.get<JobRow[]>('/api/jobs'),
       ]);
       setSettings(s);
-      setBrand(s.brand);
-      setGenerate(s.schedule.generate);
-      setPublish(s.schedule.publish);
-      setPauseUntil(s.schedule.pauseUntil ?? '');
       setHealth(h);
       setEvents(e);
       setJobs(j);
-      if (s.llm) {
-        setLlmApi(s.llm.api);
-        setLlmBase(s.llm.baseURL);
-        setLlmModel(s.llm.model);
-        setKeyMasked(s.llm.keyMasked);
-        setFromEnv(s.llm.fromEnv);
-      }
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'err');
     }
@@ -83,12 +74,14 @@ export function Settings() {
   async function save() {
     try {
       await api.post('/api/settings', {
-        brand,
-        scheduleGenerate: generate,
-        schedulePublish: publish,
-        pauseUntil,
+        brand: draftBrand.value,
+        scheduleGenerate: draftGenerate.value,
+        pauseUntil: draftPauseUntil.value,
       });
       toast('已保存');
+      draftBrand.commit();
+      draftGenerate.commit();
+      draftPauseUntil.commit();
       void load();
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'err');
@@ -99,13 +92,16 @@ export function Settings() {
     setBusy('llm');
     try {
       await api.post('/api/settings', {
-        llmApi,
-        llmBaseUrl: llmBase,
-        llmModel,
+        llmApi: draftLlmApi.value,
+        llmBaseUrl: draftLlmBase.value,
+        llmModel: draftLlmModel.value,
         ...(llmKey.trim() ? { llmApiKey: llmKey.trim() } : {}),
       });
       toast('模型配置已保存，立即生效');
       setLlmKey('');
+      draftLlmApi.commit();
+      draftLlmBase.commit();
+      draftLlmModel.commit();
       void load();
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'err');
@@ -157,38 +153,30 @@ export function Settings() {
           <input
             className="input mb-4"
             placeholder="出现在每张卡片页脚，留空则不显示"
-            value={brand}
-            onChange={(e) => setBrand(e.target.value)}
+            value={draftBrand.value}
+            onChange={(e) => draftBrand.onChange(e.target.value)}
+            onBlur={draftBrand.onBlur}
           />
 
           <label className="label">定时创作（crontab）</label>
           <input
             className="input mb-1 font-mono"
             placeholder="30 9 * * *"
-            value={generate}
-            onChange={(e) => setGenerate(e.target.value)}
+            value={draftGenerate.value}
+            onChange={(e) => draftGenerate.onChange(e.target.value)}
+            onBlur={draftGenerate.onBlur}
           />
           <div className="text-[11px] text-ink-400 mb-4">
             默认每天 09:30 从选题池取一篇创作
-          </div>
-
-          <label className="label">定时发布（crontab）</label>
-          <input
-            className="input mb-1 font-mono"
-            placeholder="0 */2 * * *"
-            value={publish}
-            onChange={(e) => setPublish(e.target.value)}
-          />
-          <div className="text-[11px] text-ink-400 mb-4">
-            仅在「发布」页开启自动发布后生效
           </div>
 
           <label className="label">处置冷静期（留空 = 不启用）</label>
           <input
             className="input mb-1 font-mono"
             placeholder="2026-10-17 16:00"
-            value={pauseUntil}
-            onChange={(e) => setPauseUntil(e.target.value)}
+            value={draftPauseUntil.value}
+            onChange={(e) => draftPauseUntil.onChange(e.target.value)}
+            onBlur={draftPauseUntil.onBlur}
           />
           <div className="text-[11px] text-ink-400 mb-4 leading-relaxed">
             账号被平台处置期间填这里。到期自动失效。
@@ -202,7 +190,7 @@ export function Settings() {
               type="button"
               className="text-accent-500 hover:underline mt-1"
               onClick={() =>
-                setPauseUntil(
+                draftPauseUntil.onChange(
                   new Date(Date.now() + 7 * 24 * 3600 * 1000)
                     .toISOString()
                     .slice(0, 16)
@@ -228,8 +216,8 @@ export function Settings() {
           <label className="label">API 格式</label>
           <select
             className="input mb-1"
-            value={llmApi}
-            onChange={(e) => setLlmApi(e.target.value as 'openai' | 'anthropic')}
+            value={draftLlmApi.value}
+            onChange={(e) => draftLlmApi.onChange(e.target.value as 'openai' | 'anthropic')}
           >
             <option value="anthropic">Anthropic Messages（/v1/messages）</option>
             <option value="openai">OpenAI Chat Completions（/chat/completions）</option>
@@ -242,16 +230,18 @@ export function Settings() {
           <input
             className="input mb-3 font-mono text-xs"
             placeholder="https://api.example.com"
-            value={llmBase}
-            onChange={(e) => setLlmBase(e.target.value)}
+            value={draftLlmBase.value}
+            onChange={(e) => draftLlmBase.onChange(e.target.value)}
+            onBlur={draftLlmBase.onBlur}
           />
 
           <label className="label">模型名</label>
           <input
             className="input mb-3 font-mono text-xs"
             placeholder="例如 glm-5.3 / MiniMax-M3.1-Flash-Preview"
-            value={llmModel}
-            onChange={(e) => setLlmModel(e.target.value)}
+            value={draftLlmModel.value}
+            onChange={(e) => draftLlmModel.onChange(e.target.value)}
+            onBlur={draftLlmModel.onBlur}
           />
 
           <label className="label">API Key</label>

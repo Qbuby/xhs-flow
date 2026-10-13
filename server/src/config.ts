@@ -8,7 +8,14 @@ loadEnv();
 const here = path.dirname(fileURLToPath(import.meta.url));
 // dist/config.js -> 项目根
 export const ROOT_DIR = path.resolve(here, '..', '..');
-export const DATA_DIR = path.resolve(ROOT_DIR, 'data');
+/**
+ * 数据目录可整体重定向（sqlite + 图片缓存 + 浏览器 profile 跟着一起走）。
+ * 正常运行不用管；导入导出的验证脚本靠它把 import 打进一个一次性沙盒库，
+ * 不碰真实数据。media/profile 是它的子目录，所以天然同步生效。
+ */
+export const DATA_DIR = process.env.XHSFLOW_DATA_DIR
+  ? path.resolve(process.env.XHSFLOW_DATA_DIR)
+  : path.resolve(ROOT_DIR, 'data');
 export const MEDIA_DIR = path.join(DATA_DIR, 'media');
 export const PROFILE_DIR = path.join(DATA_DIR, 'chrome-profile');
 export const WEB_DIST = path.resolve(ROOT_DIR, 'web', 'dist');
@@ -75,13 +82,11 @@ export interface AppConfig {
      * 默认值刻意避开整点和等间隔。
      * 「每两小时整点」在风控看来就是一条等距的时间线；
      * 真人一天去创作中心两三次，而且不会恰好都在整点。
+     *
+     * 只有创作一项 —— 发布自 2026-10-12 起改为纯手动（见 http/server.ts
+     * 的发布准备台），不再有定时发布。
      */
     generate: string;
-    publish: string;
-  };
-  publish: {
-    auto: boolean;
-    intervalSec: number;
   };
   /**
    * 防风控。2026-10-10 账号因「浏览行为异常或不规律」被限制曝光，
@@ -128,13 +133,6 @@ export const config: AppConfig = {
   schedule: {
     // 09:30 → 10:20：早上的第一件事应该是看数据，不是发稿
     generate: str(process.env.XHSFLOW_SCHEDULE_GENERATE, '20 10 * * *'),
-    // 每两小时整点 → 一天三次、时刻错开
-    publish: str(process.env.XHSFLOW_SCHEDULE_PUBLISH, '25 10,16,21 * * *'),
-  },
-
-  publish: {
-    auto: bool(process.env.XHSFLOW_PUBLISH_AUTO, false),
-    intervalSec: num(process.env.XHSFLOW_PUBLISH_INTERVAL_SEC, 45),
   },
 
   risk: {

@@ -28,9 +28,13 @@ import { scrapeAuthor, listSources } from '../xhs/scrape.js';
 import { signerState, resetSigner } from '../xhs/signing.js';
 import { getStyleProfile } from '../corpus/profile.js';
 import { composeDraft, ideateTopics, renderDraftCards } from '../generate/pipeline.js';
-import { DEFAULT_SPEC, renderCard } from '../generate/cards.js';
-import { autoPublishEnabled, enqueue, schedulerInfo, runNow } from '../scheduler/jobs.js';
+import { renderCard, toResolved } from '../generate/cards.js';
+import { enqueue, schedulerInfo, runNow } from '../scheduler/jobs.js';
 import { approvedDrafts } from '../xhs/publish.js';
+import { exportCorpusZip, importCorpusZip } from '../corpus/transfer.js';
+import { createZip, type ZipEntryInput } from '../util/zip.js';
+import { CREATOR_ORIGIN } from '../xhs/browser.js';
+import { plainText } from '../xhs/publish.js';
 import { llmHealth, llmInfo } from '../llm/client.js';
 import {
   getLlmConfig,
@@ -42,9 +46,8 @@ import { activeProviders } from '../media/stock.js';
 import { browseBudget, enforceBrowse, inCooldown, noteBrowseStart, quietHoursNow } from '../util/human.js';
 
 /** 把 cron 表达式翻译成「下一次会是什么时候」，创作台要显示。 */
-function nextRunTimes(): { generate: string | null; publish: string | null; rescrape: string | null } {
+function nextRunTimes(): { generate: string | null; rescrape: string | null } {
   const gen = getSetting('schedule_generate') ?? config.schedule.generate;
-  const pub = getSetting('schedule_publish') ?? config.schedule.publish;
   const re = getSetting('schedule_rescrape') ?? '40 10 * * *';
   const calc = (p: string): string | null => {
     if (!p?.trim()) return null;
@@ -57,7 +60,7 @@ function nextRunTimes(): { generate: string | null; publish: string | null; resc
       return null;
     }
   };
-  return { generate: calc(gen), publish: calc(pub), rescrape: calc(re) };
+  return { generate: calc(gen), rescrape: calc(re) };
 }
 
 export async function buildServer() {
@@ -120,8 +123,6 @@ export async function buildServer() {
     },
     schedule: {
       generate: getSetting('schedule_generate') ?? config.schedule.generate,
-      publish: getSetting('schedule_publish') ?? config.schedule.publish,
-      autoPublish: autoPublishEnabled(),
       // 创作台的新配置
       autoCompose: (getSetting('auto_compose') ?? 'false') === 'true',
       autoIdeate: (getSetting('auto_ideate') ?? 'true') === 'true',
@@ -143,8 +144,6 @@ export async function buildServer() {
     };
     setStr('brand', body.brand);
     setStr('schedule_generate', body.scheduleGenerate);
-    setStr('schedule_publish', body.schedulePublish);
-    setStr('auto_publish', body.autoPublish);
     setStr('auto_compose', body.autoCompose);
     setStr('auto_ideate', body.autoIdeate);
     setStr('compose_per_run', body.composePerRun);
@@ -351,7 +350,30 @@ export async function buildServer() {
       id,
     );
     const profile = getStyleProfile(id);
-    return { source, stats, notes, styleProfile: profile?.profile ?? null, cardSpec: profile?.profile.card_template_spec ?? DEFAULT_SPEC };
+    // 画像里存的可能是新契约，也可能是库里遗留的旧 18 字段 ——
+    // toResolved 两种都吃，顺带把旧的迁移过来。
+    const resolved = toResolved(profile?.profile.card_template_spec);
+    return {
+      source,
+      stats,
+      notes,
+      styleProfile: profile?.profile ?? null,
+      // 前端不再自己读 hex。这里回填的是**归一后的契约**（旧画像读出来
+      // 就是迁移后的新契约），并把解析出来的真实色值一起给出去。
+      cardSpec: resolved.contract,
+      design: {
+        theme: resolved.theme,
+        paletteName: resolved.palette.name,
+        texture: resolved.texture,
+        motifs: resolved.motifs,
+        accentStyle: resolved.accentStyle,
+        typeScale: resolved.contract.type_scale,
+        density: resolved.contract.density,
+        bg: resolved.palette.bg,
+        ink: resolved.palette.ink,
+        accent: resolved.palette.accent,
+      },
+    };
   });
 
   app.post('/api/sources/:id/delete', async (req) => {
@@ -610,36 +632,223 @@ export async function buildServer() {
     }
   });
 
-  /* ---------------- 发布 ---------------- */
+  /* ---------------- 发布准备台 ---------------- */
 
+  /**
+   * 2026-10-12 起，**取消一切自动化发布**。
+   *
+   * 背景：账号在 2026-10-10 因「AI 模拟浏览」被限制曝光一周，官方点名的正是
+   * 「用第三方工具模拟真人操作」。发布这条链路是全部功能里最重的机器行为：
+   * 打开创作中心、传图、逐字填表、点发布、再回管理页核对 —— 全程没有一个
+   * 真人在回路里。拟人节奏只能降低概率，压不住这个量级的暴露面。
+   *
+   * 所以改成「发布准备台」：我们把素材按小红书能直接吃的形态备齐
+   * （文案纯文本一键复制 / 图片按顺序打包 / 创作中心一键打开），
+   * 最后粘贴、传图、点发布由人在真身浏览器里完成。
+   *
+   * publishNote() 及 xhs/publish.ts 整体保留但不再被调用 —— 它是唯一
+   * 经过实发验证的代码（笔记 6aca12cd000000001801a737），将来若调整策略
+   * 还得靠它。verify-publish.js --live 也留着，但默认 dry run。
+   */
   app.get('/api/publish/queue', async () => approvedDrafts());
 
-  app.post('/api/publish/run', async (_req, reply) => {
-    // 发布是最重的一次会话（打开创作中心、传图、填表、点发布）。
-    // 冷静期 / 安静时段 / 额度 / 间隔任一不过就直接拒绝，并把原因说清楚。
-    const gate = enforceBrowse('publish', { auto: false });
-    if (!gate.ok) {
-      reply.code(429);
-      return {
-        error: gate.reason ?? '防风控拦截',
-        hint: gate.waitMin ? `还要等约 ${gate.waitMin} 分钟。` : undefined,
-      };
+  /**
+   * 取一篇草稿的发布素材（准备台用）。
+   *
+   * 图片按 idx 顺序给出，且**复制前先按发布顺序重命名** ——
+   * 小红书的图片上传框按文件名排序，直接给 card-<时间戳>-<随机>.jpg
+   * 的顺序是乱的，人会传错图。所以打包时就落成 01.jpg / 02.jpg …
+   */
+  app.get('/api/publish/prep/:id', async (req) => {
+    const id = Number((req.params as { id: string }).id);
+    const draft = get<{ id: number; title: string; body: string; tags: string; rendered: number }>(
+      'SELECT id, title, body, tags, rendered FROM drafts WHERE id = ?',
+      id,
+    );
+    if (!draft) return { error: '草稿不存在' };
+
+    const cards = all<{ idx: number; layout: string; image_path: string | null }>(
+      'SELECT idx, layout, image_path FROM draft_cards WHERE draft_id = ? ORDER BY idx',
+      id,
+    );
+    const images = cards
+      .filter((c) => c.image_path)
+      .map((c) => ({ idx: c.idx, layout: c.layout, image_path: c.image_path as string }));
+
+    let tags: string[] = [];
+    try {
+      const arr = JSON.parse(draft.tags || '[]') as unknown;
+      if (Array.isArray(arr)) tags = arr.map(String);
+    } catch {
+      /* 保持空 */
     }
-    return { jobId: enqueue('publish', {}) };
+
+    return {
+      draft: {
+        id: draft.id,
+        title: draft.title,
+        // 正文在**准备台这一侧**再洗一遍。
+        //
+        // 为什么不在生成端一劳永逸：pipeline.normalizeBody() 已经会剥掉尾部的
+        // 话题标签，但历史草稿（2026-10-12 之前生成的）里有正文中间夹着
+        // `#品牌营销[话题]#` 的形态 —— 那句紧贴着 CTA，正则没匹配上。
+        // 发布台的正文是要用户直接粘贴出去的，带这种残留就是明显的机器痕迹，
+        // 所以在这里兜底：不依赖语料/生成端何时修过。
+        body: plainText(stripTopicTags(draft.body)),
+        tags,
+        rendered: Boolean(draft.rendered),
+        imageCount: images.length,
+      },
+      images,
+      creatorUrl: `${CREATOR_ORIGIN}/publish/publish?target=image`,
+    };
   });
 
-  app.post('/api/publish/:id', async (req, reply) => {
+  /**
+   * 把正文里的小红书话题标签洗成纯文本。
+   *
+   * 两种形态：
+   *   1. `#话题[话题]#` —— 抓语料时从小红书 DOM 原样带下来的（页面把话题渲染成
+   *      `<a class="tiptap-topic">#词<span class="content-hide">[话题]#</span></a>`）
+   *   2. 独立成行的 `#话题 #话题`（作者的标签堆）
+   *
+   * 处理原则：**只删标签本身，不动它周围的文字和空行**。
+   * 理由是这段文字用户会原样粘贴到小红书，段落结构得保留；
+   * 而话题标签小红书自己会加（发布台单独给一份 tags 让用户手动加），
+   * 正文里留着反而是脏的。
+   */
+  function stripTopicTags(body: string): string {
+    return body
+      // ① 任意位置（含行尾）的 `#词[话题]#`，连同它前面可能的空格
+      .replace(/[ \t]*#[^\s#\n]{1,30}\[话题\]#/g, '')
+      // ② 独立成行的标签堆（整行只有 #话题 #话题…）
+      .replace(/^[ \t]*(#[^\s#\n]{1,30}[ \t]*){2,}$/gm, '')
+      // 洗完之后可能留下连续空行，压回一个
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  /**
+   * 把一篇草稿的图片按发布顺序打成 zip。
+   *
+   * 条目名用 01.jpg / 02.jpg …，解压后按文件名排序就是发布顺序 ——
+   * 用户解压后全选上传即可，不用记卡片顺序。
+   */
+  app.get('/api/publish/images/:id', async (req, reply) => {
     const id = Number((req.params as { id: string }).id);
-    const gate = enforceBrowse('publish', { auto: false });
-    if (!gate.ok) {
-      reply.code(429);
-      return {
-        error: gate.reason ?? '防风控拦截',
-        hint: gate.waitMin ? `还要等约 ${gate.waitMin} 分钟。` : undefined,
-      };
+    const cards = all<{ idx: number; image_path: string | null }>(
+      'SELECT idx, image_path FROM draft_cards WHERE draft_id = ? AND image_path IS NOT NULL ORDER BY idx',
+      id,
+    );
+    if (cards.length === 0) {
+      reply.code(400);
+      return { error: '这篇草稿还没有渲染好的图片' };
     }
-    const r = run("UPDATE drafts SET status='approved' WHERE id=? AND status <> 'published'", id);
-    return { ok: r.changes > 0, jobId: enqueue('publish', {}) };
+
+    const entries: ZipEntryInput[] = [];
+    const missing: string[] = [];
+    for (const [i, c] of cards.entries()) {
+      try {
+        entries.push({
+          name: `${String(i + 1).padStart(2, '0')}.jpg`,
+          data: await fsPromises.readFile(c.image_path as string),
+          store: true,
+        });
+      } catch {
+        missing.push(String(c.image_path));
+      }
+    }
+    if (entries.length === 0) {
+      reply.code(400);
+      return { error: `图片文件都不在磁盘上了（${missing.slice(0, 2).join(', ')}），需要重新渲染` };
+    }
+
+    reply.header('Content-Type', 'application/zip');
+    reply.header(
+      'Content-Disposition',
+      `attachment; filename="xhsflow-draft-${id}-images.zip"`,
+    );
+    return reply.send(createZip(entries));
+  });
+
+  /** 手动登记发布结果：填真实笔记链接，把草稿归档成 published。 */
+  app.post('/api/publish/mark/:id', async (req) => {
+    const id = Number((req.params as { id: string }).id);
+    const { url } = (req.body ?? {}) as { url?: string };
+    const trimmed = (url ?? '').trim();
+    if (!trimmed) {
+      run("UPDATE drafts SET status='published', published_at=datetime('now'), updated_at=datetime('now') WHERE id=?", id);
+      return { ok: true, note: '未填链接，已按已发布归档' };
+    }
+    // 只收小红书笔记链接；填错域名多半是复制到了别的东西
+    if (!/^https?:\/\/(www\.)?xiaohongshu\.com\//.test(trimmed)) {
+      return { error: '看起来不是小红书笔记链接（应为 https://www.xiaohongshu.com/explore/… ）' };
+    }
+    run(
+      `UPDATE drafts SET status='published', published_url=?, published_at=datetime('now'),
+         publish_error=NULL, updated_at=datetime('now') WHERE id=?`,
+      trimmed,
+      id,
+    );
+    return { ok: true };
+  });
+
+  /* ---------------- 语料库导入导出 ---------------- */
+
+  // 导入走的是原始 zip 请求体。Fastify 默认只认 json/text，
+  // 这里给 zip 挂一个 buffer 解析器（parseAs: 'buffer'）。
+  // Windows 下有的浏览器/工具会把 zip 标成 x-zip-compressed，一并接住。
+  for (const ctype of ['application/zip', 'application/x-zip-compressed', 'application/octet-stream']) {
+    app.addContentTypeParser(ctype, { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
+  }
+
+  app.get('/api/corpus/export', async (req, reply) => {
+    const q = req.query as { sourceId?: string };
+    const sourceId = q.sourceId && q.sourceId !== 'all' ? Number(q.sourceId) : null;
+    if (q.sourceId && q.sourceId !== 'all' && !Number.isFinite(sourceId)) {
+      reply.code(400);
+      return { error: `sourceId 无效：${q.sourceId}` };
+    }
+
+    try {
+      const { buf, filename, summary } = await exportCorpusZip(sourceId);
+      reply.header('Content-Type', 'application/zip');
+      reply.header('Content-Disposition', `attachment; filename="${filename}"`);
+      reply.header('X-Export-Counts', JSON.stringify(summary.counts));
+      return reply.send(buf);
+    } catch (err) {
+      reply.code(400);
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  app.post('/api/corpus/import', { bodyLimit: 1024 * 1024 * 1024 }, async (req, reply) => {
+    const body = req.body as Buffer | string | undefined;
+    if (!Buffer.isBuffer(body) || body.length === 0) {
+      reply.code(400);
+      return { error: '请求体不是 zip 数据（应为 application/zip 的原始字节）' };
+    }
+
+    try {
+      const summary = await importCorpusZip(body);
+      return { ok: true, summary };
+    } catch (err) {
+      reply.code(400);
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  app.get('/api/corpus/overview', async () => {
+    // 导出按钮上要先展示「会带走多少东西」，这个数字必须便宜地拿到
+    const row = get<{ sources: number; notes: number; images: number; styles: number; topics: number }>(`
+      SELECT
+        (SELECT COUNT(*) FROM sources) AS sources,
+        (SELECT COUNT(*) FROM notes) AS notes,
+        (SELECT COUNT(*) FROM note_images) AS images,
+        (SELECT COUNT(*) FROM note_styles) AS styles,
+        (SELECT COUNT(*) FROM topics) AS topics
+    `);
+    return row ?? { sources: 0, notes: 0, images: 0, styles: 0, topics: 0 };
   });
 
   /* ---------------- 调度 ---------------- */

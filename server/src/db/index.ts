@@ -32,7 +32,7 @@ for (const sql of MIGRATIONS) {
 /* 查询辅助                                                            */
 /* ------------------------------------------------------------------ */
 
-type Row = Record<string, unknown>;
+export type Row = Record<string, unknown>;
 
 /** node:sqlite 的 statement.all() 返回 unknown[]，这里收窄一下。 */
 export function all<T = Row>(sql: string, ...params: unknown[]): T[] {
@@ -98,7 +98,7 @@ export function allSettings(): Record<string, string> {
 /* 事件（降级 / 诊断）                                                  */
 /* ------------------------------------------------------------------ */
 
-export type EventKind = 'fallback' | 'signature' | 'cookie' | 'risk' | 'publish' | 'error';
+export type EventKind = 'fallback' | 'signature' | 'cookie' | 'risk' | 'publish' | 'corpus' | 'error';
 export type EventSeverity = 'info' | 'warn' | 'error';
 
 export function logEvent(

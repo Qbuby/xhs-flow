@@ -15,7 +15,7 @@ import { chromium } from 'playwright';
 import { PROFILE_DIR, MEDIA_DIR } from '../config.js';
 import { run, get, all, db, transaction } from '../db/index.js';
 import { browser } from '../xhs/browser.js';
-import { renderCard, DEFAULT_SPEC, type Card } from '../generate/cards.js';
+import { renderCard, type Card } from '../generate/cards.js';
 import sharp from 'sharp';
 import { logger } from '../logger.js';
 
@@ -262,8 +262,10 @@ async function seed(): Promise<void> {
       run('INSERT INTO notes_fts_map(rowid, note_pk) VALUES (?,?)', notePk, notePk);
     });
 
-    // 用我们自己的渲染器生成 3 张「笔记配图」——既是占位，也是给渲染器再做一次回归
-    const spec = { ...DEFAULT_SPEC, background: n.color, accent: n.accent };
+    // 用我们自己的渲染器生成 3 张「笔记配图」——既是占位，也是给渲染器再做一次回归。
+    // 注意这里**不能**按每条笔记自定义配色了：渲染规格统一来自设计契约
+    // （design/contract.ts），不再由调用方逐条覆盖 hex —— 那正是"给无限的颜色
+    // 选择更容易做出难看的东西"的老路。
     const cards: Card[] = [
       {
         layout: 'cover',

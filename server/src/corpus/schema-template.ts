@@ -22,5 +22,14 @@ export function asTemplate(schema: z.ZodTypeAny): unknown {
     return asTemplate(def['innerType'] as z.ZodTypeAny);
   }
   if (typeName === 'ZodEnum') return def['values'];
+  // 联合类型只拿第一个分支做模板。
+  //
+  // 用途：`card_template_spec` 声明成「新契约 OR 旧 18 字段」—— 这样历史画像
+  // 还能解析出来，但**提示词里只给新契约的形状**，模型就不会再产出旧形状。
+  // 不这样处理的话 asTemplate 会退化成 "…"，模型又只能自己发明字段名。
+  if (typeName === 'ZodUnion') {
+    const options = (def['options'] as z.ZodTypeAny[] | undefined) ?? [];
+    return options[0] ? asTemplate(options[0]) : '…';
+  }
   return '…';
 }

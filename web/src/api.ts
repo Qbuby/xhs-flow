@@ -66,8 +66,6 @@ export interface Health {
   scheduler: {
     running: boolean;
     generate: string;
-    publish: string;
-    autoPublish: boolean;
     pending: number;
     running_jobs: number;
     failed: number;
@@ -187,4 +185,91 @@ export function fmtNum(n: number | null | undefined): string {
   if (n >= 10000) return `${(n / 10000).toFixed(1)}w`;
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
+}
+
+/* ----------------------------- 语料库导入导出 ----------------------------- */
+
+export interface CorpusOverview {
+  sources: number;
+  notes: number;
+  images: number;
+  styles: number;
+  topics: number;
+}
+
+export interface CorpusImportSummary {
+  sourcesAdded: number;
+  sourcesMerged: number;
+  notesAdded: number;
+  notesSkipped: number;
+  imagesAdded: number;
+  imagesSkipped: number;
+  stylesAdded: number;
+  stylesSkipped: number;
+  profilesAdded: number;
+  profilesSkipped: number;
+  topicsAdded: number;
+  topicsSkipped: number;
+  filesWritten: number;
+  imagesWithoutFile: number;
+}
+
+/**
+ * 导出语料库为 zip 并触发浏览器下载。
+ *
+ * 走 fetch → blob 而不是直接 window.open：出错时服务端返回的是 JSON，
+ * 用 location 跳过去会看到一屏裸错误；blob 方式能把错误接进 toast。
+ */
+export async function exportCorpus(sourceId: number | 'all'): Promise<void> {
+  const res = await fetch(`/api/corpus/export?sourceId=${sourceId}`);
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? `HTTP ${res.status}`);
+  }
+  // 服务端给的文件名在 Content-Disposition 里；fetch 拿不到跨域头，这里自己拼
+  const blob = await res.blob();
+  const stamp = new Date().toISOString().slice(0, 10);
+  const name = `xhsflow-corpus-${sourceId}-${stamp}.zip`;
+  const url = URL.createObjectURL(blob);
+  try {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  }
+}
+
+/**
+ * 导入语料库 zip。不走 api.post（那个会把 body JSON 序列化），
+ * 直接把 File 原样作为请求体、标 application/zip 发出去。
+ */
+export async function importCorpus(file: File): Promise<CorpusImportSummary> {
+  const res = await fetch('/api/corpus/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/zip' },
+    body: file,
+  });
+  const body = (await res.json().catch(() => ({}))) as {
+    error?: string;
+    summary?: CorpusImportSummary;
+  };
+  if (!res.ok || body.error) throw new Error(body.error ?? `HTTP ${res.status}`);
+  if (!body.summary) throw new Error('导入完成但没有返回结果明细');
+  return body.summary;
+}
+
+export function describeImport(s: CorpusImportSummary): string {
+  const parts = [
+    `来源 +${s.sourcesAdded}`,
+    `笔记 +${s.notesAdded}`,
+    `图片 ${s.filesWritten} 张`,
+  ];
+  if (s.sourcesMerged) parts.push(`来源合并 ${s.sourcesMerged}`);
+  if (s.notesSkipped) parts.push(`跳过已有笔记 ${s.notesSkipped}`);
+  if (s.imagesWithoutFile) parts.push(`缺图 ${s.imagesWithoutFile}`);
+  return parts.join(' · ');
 }

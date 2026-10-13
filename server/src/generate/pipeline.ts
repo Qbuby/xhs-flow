@@ -5,7 +5,8 @@ import { getStyleProfile, type StyleProfile } from '../corpus/profile.js';
 import { retrieveWithFallback, type RetrievedNote } from '../corpus/retrieve.js';
 import { logger } from '../logger.js';
 import { MEDIA_DIR } from '../config.js';
-import { renderCards, type Card, type Layout, LAYOUTS } from './cards.js';
+import { renderCards, toResolved, CARD_WIDTH, type Card, type Layout, LAYOUTS } from './cards.js';
+import { maxTitleLines, type ResolvedSpec } from './design/index.js';
 import { stripEmoji } from '../util/text.js';
 import path from 'node:path';
 
@@ -54,6 +55,58 @@ const SYSTEM = `你是一位小红书爆款内容操盘手，正在为一个自�
 4. 必须严格遵守 do_list / dont_list。
 5. 只输出 JSON。`;
 
+/**
+ * 把设计契约翻译成**对文案的指令**。
+ *
+ * 这是整条链路上投入产出比最高的一段：不改渲染器，只改提示词，
+ * 生成的卡片立刻"对得上版面"。原因很具体 ——
+ * `accent_style='highlight'` 只适合 2-4 字的短词，`'block'` 几乎只适合 2-3 字，
+ * 而模型此前完全不知道会是哪种，于是 [[高亮]] 里塞进整句话，渲染出来就是灾难。
+ * 同理：标题能写多长取决于字号档与标题行数上限，每卡几条取决于密度档。
+ *
+ * 旧实现把 `card_template_spec` 声明成 18 个纯视觉字段，13 个从不流向
+ * 生成它们的 LLM —— 这就是"设计约束"与"文案创作"之间的那道断链。
+ */
+function buildVisualConstraints(profile: StyleProfile): string {
+  const spec: ResolvedSpec = toResolved(profile.card_template_spec);
+  const lines = maxTitleLines(spec.theme);
+  const top = spec.type.title;
+
+  // 标题的每行字数上限：按字号换算。1080 减去左右内边距是可用宽度，
+  // 中文按 1em/字估，再留 8% 余量给标点与折行误差。
+  const usableW = CARD_WIDTH - spec.density.paddingX * 2;
+  const charsPerLine = Math.floor((usableW / top) * 0.92);
+
+  const accentRules: Record<string, string> = {
+    highlight: '只标 2-4 个字的短词（高亮底色），不要整句',
+    block: '只标 2-3 个字的词（实色块），更短更狠',
+    underline: '可以标 4-8 字的短语（下划线），适合半句',
+    bracket: '可标 4-10 字（加框），适合一个独立概念',
+    none: '这张卡没有强调样式，[[方括号]] 会被忽略，别用',
+  };
+
+  return [
+    '【版面约束 —— 卡片是按这些参数渲染的，文案必须配得上】',
+    `- 视觉语言：${spec.theme}（${THEME_DESC[spec.theme]}）`,
+    `- 配色：${spec.palette.name} 一套，底色 ${spec.palette.bg}，主色 ${spec.palette.ink}，强调色 ${spec.palette.accent}`,
+    `  ⚠️ 你**不能**改颜色。写得再"清新"也不会改变配色，别在文案里提颜色。`,
+    `- 字号档：${spec.contract.type_scale}，标题约 ${top}px`,
+    `- 标题最多 ${lines} 行，每行约 ${charsPerLine} 个汉字`,
+    `  → 所以卡片标题总长控制在 ${charsPerLine * lines} 字以内；**换行用 \\n 手动断**，别让渲染器自己折`,
+    `- 密度：${spec.contract.density}，每卡最多 ${spec.density.maxItems} 条`,
+    `  → list / steps / compare 的条目数不要超过这个数，超出的会被静默丢掉`,
+    `- 强调 [[方括号]]：${accentRules[spec.accentStyle] ?? accentRules['highlight']}`,
+    `- 装饰件：${spec.motifs.join('、')}（渲染器自己加，你只管写文案）`,
+  ].join('\n');
+}
+
+/** 主题一句话说明，提示词里用。 */
+const THEME_DESC: Record<ResolvedSpec['theme'], string> = {
+  'still-paper': '暖纸底 + 衬线大字 + 大留白，杂志画册气质，信息克制',
+  'signal-proof': '档案纸 + 细线 + 等宽元信息，像一份可引用的文件，信息密度高',
+  'bridge-canvas': '满铺影像 + 黑边字幕，靠图吃饭，文字极少',
+};
+
 function buildStyleBlock(profile: StyleProfile | null): string {
   if (!profile) return '【风格档案】尚未生成，请写通用的高质量小红书内容。';
 
@@ -79,7 +132,9 @@ function buildStyleBlock(profile: StyleProfile | null): string {
     '',
     `- 常用图片版式：${profile.visual.dominant_layouts.join('、')}`,
     `- 封面套路：${profile.visual.cover_patterns.join('；')}`,
-    `- 配色：${profile.visual.palette_summary}（主色 ${c.palette.join('、')}）`,
+    `- 配色：${profile.visual.palette_summary}`,
+    '',
+    buildVisualConstraints(profile),
     '',
     '【必须做】',
     ...profile.do_list.map((d) => `    ✓ ${d}`),
@@ -349,15 +404,25 @@ export async function renderDraftCards(draftId: number, sourceId: number | null)
 
   const paths = await renderCards(cards, { sourceId, outputDir });
 
+  // ⚠️ renderCards 现在保证**下标与输入一一对应**（失败的位置是 null），
+  // 所以这里按下标回写是安全的。之前失败时直接跳过 push，返回数组变短，
+  // 于是「第 2 张失败」会把第 3 张的图写进第 2 行 —— 静默的图片错位。
+  let written = 0;
   rows.forEach((r, i) => {
     const p = paths[i];
-    if (p) run('UPDATE draft_cards SET image_path = ? WHERE id = ?', p, r.id);
+    if (p) {
+      run('UPDATE draft_cards SET image_path = ? WHERE id = ?', p, r.id);
+      written++;
+    } else {
+      // 失败的卡片要清掉旧路径，否则界面上会一直显示上一版渲染的图
+      run('UPDATE draft_cards SET image_path = NULL WHERE id = ?', r.id);
+    }
   });
 
-  if (paths.length) {
+  if (written > 0) {
     run("UPDATE drafts SET rendered = 1, updated_at = datetime('now') WHERE id = ?", draftId);
   }
-  return paths.length;
+  return written;
 }
 
 /* ------------------------------------------------------------------ */

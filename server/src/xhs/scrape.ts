@@ -15,7 +15,8 @@ import {
   toScrapedNote,
 } from './scrape-browser.js';
 import { logger } from '../logger.js';
-import { logEvent, run, all, get, transaction } from '../db/index.js';
+import { logEvent, run, all, get } from '../db/index.js';
+import { indexNoteFts } from '../db/fts.js';
 import { parseInitialState, extractTags } from '../util/text.js';
 import { throttle } from '../util/throttle.js';
 import {
@@ -27,6 +28,7 @@ import {
   noteBrowseStart,
 } from '../util/human.js';
 import { downloadImage } from '../media/download.js';
+import { extractPalette, averageBrightness } from '../media/palette.js';
 import sharp from 'sharp';
 
 /* ------------------------------------------------------------------ */
@@ -373,8 +375,7 @@ async function storeNoteImages(notePk: number, images: string[]): Promise<void> 
       await fs.writeFile(file, buf);
 
       const info = await sharp(buf).metadata();
-      const stats = await sharp(buf).stats();
-      const bright = stats.channels.map((c) => c.mean).reduce((a, b) => a + b, 0) / 255 / 3;
+      const bright = await averageBrightness(buf);
 
       run(
         `UPDATE note_images SET local_path = ?, width = ?, height = ?, bytes = ?, sha256 = ?,
@@ -395,52 +396,6 @@ async function storeNoteImages(notePk: number, images: string[]): Promise<void> 
   }
 }
 
-
-/** 用 sharp 取主色板 —— 不依赖 LLM 看图，快且零 token。 */
-async function extractPalette(buf: Buffer): Promise<Array<{ hex: string; weight: number }>> {
-  try {
-    const { data } = await sharp(buf)
-      .resize(64, 64, { fit: 'cover' })
-      .removeAlpha()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-
-    const buckets = new Map<number, number>();
-    for (let i = 0; i < data.length; i += 3) {
-      const r = data[i] ?? 0;
-      const g = data[i + 1] ?? 0;
-      const b = data[i + 2] ?? 0;
-      // 粗量化到 5bit，抵抗压缩噪声
-      const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
-      buckets.set(key, (buckets.get(key) ?? 0) + 1);
-    }
-    const total = [...buckets.values()].reduce((a, b) => a + b, 0) || 1;
-    return [...buckets.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .map(([key, weight]) => ({
-        hex: '#' + key.toString(16).padStart(6, '0').toUpperCase(),
-        weight: Number((weight / total).toFixed(3)),
-      }));
-  } catch {
-    return [];
-  }
-}
-
-function indexNoteFts(notePk: number, title: string, desc: string, tags: string[]): void {
-  transaction(() => {
-    run('DELETE FROM notes_fts WHERE rowid = ?', notePk);
-    run('DELETE FROM notes_fts_map WHERE rowid = ?', notePk);
-    run(
-      'INSERT INTO notes_fts(rowid, title, desc, tags) VALUES (?, ?, ?, ?)',
-      notePk,
-      title,
-      desc,
-      tags.join(' '),
-    );
-    run('INSERT INTO notes_fts_map(rowid, note_pk) VALUES (?, ?)', notePk, notePk);
-  });
-}
 
 /* ------------------------------------------------------------------ */
 /* 主流程                                                              */

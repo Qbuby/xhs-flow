@@ -1,6 +1,14 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, type Source } from '../api';
+import {
+  api,
+  exportCorpus,
+  importCorpus,
+  describeImport,
+  type CorpusOverview,
+  type CorpusImportSummary,
+  type Source,
+} from '../api';
 import { Card, SectionTitle, StatusBadge, Spinner, Empty, ErrorBox } from '../components';
 import { toast } from '../store';
 
@@ -11,10 +19,19 @@ export function Sources() {
   const [maxNotes, setMaxNotes] = useState(200);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [overview, setOverview] = useState<CorpusOverview | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   async function load() {
     try {
-      setSources(await api.get<Source[]>('/api/sources'));
+      const [list, ov] = await Promise.all([
+        api.get<Source[]>('/api/sources'),
+        api.get<CorpusOverview>('/api/corpus/overview'),
+      ]);
+      setSources(list);
+      setOverview(ov);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -55,12 +72,86 @@ export function Sources() {
     }
   }
 
+  /** 导出全部语料源。带图片，几十 MB 量级，本地生成通常几秒。 */
+  async function doExport() {
+    setExporting(true);
+    try {
+      await exportCorpus('all');
+      toast('已导出并开始下载');
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), 'err');
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  async function onImportFile(file: File) {
+    if (!file.name.toLowerCase().endsWith('.zip')) {
+      toast('请选择导出生成的 .zip 语料包', 'err');
+      return;
+    }
+    setImporting(true);
+    try {
+      const s = await importCorpus(file);
+      toast(`导入完成：${describeImport(s)}`);
+      void load();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), 'err');
+    } finally {
+      setImporting(false);
+      if (fileRef.current) fileRef.current.value = '';
+    }
+  }
+
   return (
     <div>
       <SectionTitle
         title="语料库"
-        desc="添加要模仿的小红书作者主页，抓取其全部图文作品"
+        desc={
+          overview
+            ? `${overview.sources} 个作者 · ${overview.notes} 篇笔记 · ${overview.images} 张图片`
+            : '添加要模仿的小红书作者主页，抓取其全部图文作品'
+        }
+        action={
+          <div className="flex gap-2">
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".zip,application/zip,application/x-zip-compressed"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void onImportFile(f);
+              }}
+            />
+            <button
+              className="btn-ghost"
+              disabled={importing}
+              onClick={() => fileRef.current?.click()}
+            >
+              {importing ? '导入中…' : '导入'}
+            </button>
+            <button
+              className="btn-ghost"
+              disabled={exporting || !overview || overview.sources === 0}
+              onClick={() => void doExport()}
+              title={
+                overview && overview.sources > 0
+                  ? `导出 ${overview.sources} 个来源 / ${overview.notes} 篇笔记（含图片）`
+                  : undefined
+              }
+            >
+              {exporting ? '打包中…' : '导出全部'}
+            </button>
+          </div>
+        }
       />
+
+      {importing && (
+        <div className="mb-4 rounded-lg bg-ink-50 border border-ink-200 px-4 py-3 text-sm text-ink-600">
+          正在导入语料包…包里带着全部笔记图片，大的可能要等十几秒，别关页面。
+        </div>
+      )}
 
       <ErrorBox error={error} />
 
@@ -89,7 +180,7 @@ export function Sources() {
         </div>
         <p className="text-[11px] text-ink-400 mt-2">
           建议用小号抓取。全量扫描有触发风控的可能，系统已内置对数正态请求节流，
-          但仍建议控制抓取频率。
+          但仍建议控制抓取频率。换设备时用右上角「导出 / 导入」整包搬走，草稿不包含在内。
         </p>
       </Card>
 

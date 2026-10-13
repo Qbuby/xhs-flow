@@ -267,44 +267,10 @@ export async function searchStock(query: string, count = 2): Promise<StockImage[
  * 给中文关键词找一个英文检索词。
  * 图库对中文支持很差，这里过一遍常见映射，命中不了就原样送出去。
  */
-const ZH_EN_HINTS: Record<string, string> = {
-  咖啡: 'coffee latte cafe',
-  茶: 'tea',
-  美妆: 'makeup cosmetics beauty',
-  护肤: 'skincare cosmetic bottle',
-  穿搭: 'fashion outfit clothing',
-  健身: 'fitness workout gym',
-  美食: 'food dish restaurant',
-  旅行: 'travel landscape',
-  宠物: 'cat dog pet',
-  职场: 'office desk workspace',
-  数码: 'laptop technology desk',
-  家居: 'interior home living room furniture',
-  书: 'books reading library',
-  商业: 'business office meeting',
-  品牌: 'brand design minimal packaging',
-  摄影: 'photography camera',
-  植物: 'plant green leaves',
-  音乐: 'music headphones',
-  运动: 'sports running',
-  厨房: 'kitchen cooking',
-  收纳: 'storage shelf organize',
-  空间: 'interior room design',
-  营销: 'marketing business',
-};
-
-export function toSearchHint(keyword: string): string {
-  // 只取**一个**最贴切的映射。多个映射拼在一起会变成
-  // "coffee latte cafe interior room design" 这种六概念长句，
-  // 图库的 AND 语义下必然零结果（实测确实如此）。
-  // 宁可少给关键词，也要保证能搜到东西。
-  const hits = Object.entries(ZH_EN_HINTS)
-    .filter(([zh]) => keyword.includes(zh))
-    .sort((a, b) => b[0].length - a[0].length);
-  const primary = hits[0]?.[1];
-  if (!primary) return keyword;
-
-  // 已经含英文/数字为主的查询（模型有时直接给英文）就原样用
-  const latin = keyword.replace(/[^ -]/g, '').trim();
-  return latin.length >= 6 ? latin : primary;
-}
+/**
+ * 中文 → 英文检索词映射见 media/hints.ts。
+ *
+ * 这里 re-export 一下，保持既有的 `import { toSearchHint } from '../media/stock.js'`
+ * 调用点不用改（cards.ts 就是这么引的）。
+ */
+export { toSearchHint } from './hints.js';

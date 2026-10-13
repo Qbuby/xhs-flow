@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { api } from '../api';
 import { Card, SectionTitle, StatusBadge, Spinner, Empty, Dot } from '../components';
 import { toast } from '../store';
+import { useDraftValue } from '../useDraftValue';
 import {
   cronToParts,
   partsToCron,
@@ -39,14 +40,12 @@ interface Settings {
   brand: string;
   schedule: {
     generate: string;
-    publish: string;
-    autoPublish: boolean;
     autoCompose?: boolean;
     autoIdeate?: boolean;
     composePerRun?: number;
     ideatePerRun?: number;
   };
-  nextRun?: { generate: string | null; publish: string | null };
+  nextRun?: { generate: string | null };
 }
 
 export function Studio() {
@@ -61,14 +60,18 @@ export function Studio() {
   const [angle, setAngle] = useState('');
   const [newTopic, setNewTopic] = useState('');
 
-  const [parts, setParts] = useState<ScheduleParts>(cronToParts('30 9 * * *'));
-  const [autoCompose, setAutoCompose] = useState(false);
-  const [autoIdeate, setAutoIdeate] = useState(true);
-  const [perRun, setPerRun] = useState(1);
-  const [ideateCount, setIdeateCount] = useState(6);
-  const [brand, setBrand] = useState('');
+  // 这几个字段都是「从服务器来、用户可能正在改」的输入项。
+  // 页面每 12 秒轮询一次，直接 setState 会把用户打了一半的字冲掉，
+  // 所以走 useDraftValue：编辑中不被轮询覆盖，失焦才回归服务器值。
+  const serverParts = cronToParts(settings?.schedule.generate ?? '30 9 * * *');
+  const draftParts = useDraftValue(serverParts);
+  const draftAutoCompose = useDraftValue(Boolean(settings?.schedule.autoCompose));
+  const draftAutoIdeate = useDraftValue(settings?.schedule.autoIdeate !== false);
+  const draftPerRun = useDraftValue(Number(settings?.schedule.composePerRun ?? 1));
+  const draftIdeateCount = useDraftValue(Number(settings?.schedule.ideatePerRun ?? 6));
+  const draftBrand = useDraftValue(settings?.brand ?? '');
 
-  const load = useCallback(async () => {
+  const load = useCallback(async() => {
     try {
       const [st, se] = await Promise.all([
         api.get<Studio>('/api/studio/topics'),
@@ -76,12 +79,6 @@ export function Studio() {
       ]);
       setStudio(st);
       setSettings(se);
-      setParts(cronToParts(se.schedule.generate));
-      setAutoCompose(Boolean(se.schedule.autoCompose));
-      setAutoIdeate(se.schedule.autoIdeate !== false);
-      setPerRun(se.schedule.composePerRun ?? 1);
-      setIdeateCount(se.schedule.ideatePerRun ?? 6);
-      setBrand(se.brand);
       setSourceId((cur) => cur ?? st.sources[0]?.id ?? null);
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'err');
@@ -100,14 +97,22 @@ export function Studio() {
     setBusy('settings');
     try {
       await api.post('/api/settings', {
-        brand,
-        scheduleGenerate: partsToCron(parts),
-        autoCompose,
-        autoIdeate,
-        composePerRun: perRun,
-        ideatePerRun: ideateCount,
+        brand: draftBrand.value,
+        scheduleGenerate: partsToCron(draftParts.value),
+        autoCompose: draftAutoCompose.value,
+        autoIdeate: draftAutoIdeate.value,
+        composePerRun: draftPerRun.value,
+        ideatePerRun: draftIdeateCount.value,
       });
       toast('定时设置已保存');
+      // 提交成功后清除 dirty：服务器值已经是刚提交的那个，
+      // 不 commit 的话输入框会停在本地值、和服务器不一致（虽然此时恰好相同）
+      draftBrand.commit();
+      draftParts.commit();
+      draftAutoCompose.commit();
+      draftAutoIdeate.commit();
+      draftPerRun.commit();
+      draftIdeateCount.commit();
       void load();
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'err');
@@ -121,7 +126,7 @@ export function Studio() {
     setBusy('ideate');
     setRunning('ideate');
     try {
-      await api.post(`/api/sources/${sourceId}/ideate`, { count: ideateCount });
+      await api.post(`/api/sources/${sourceId}/ideate`, { count: draftIdeateCount.value });
       toast('选题生成中，完成后自动刷新');
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'err');
@@ -140,7 +145,7 @@ export function Studio() {
         sourceId,
         topic: t,
         angle: a,
-        brand,
+        brand: draftBrand.value,
       });
       toast(`已生成：${r.title}（去「草稿审核」查看）`);
     } catch (err) {
@@ -230,10 +235,10 @@ export function Studio() {
             </div>
           </div>
           <button
-            className={autoCompose ? 'btn-primary' : 'btn-ghost'}
-            onClick={() => setAutoCompose((v) => !v)}
+            className={draftAutoCompose.value ? 'btn-primary' : 'btn-ghost'}
+            onClick={() => draftAutoCompose.onChange(!draftAutoCompose.value)}
           >
-            {autoCompose ? '已开启' : '已关闭'}
+            {draftAutoCompose.value ? '已开启' : '已关闭'}
           </button>
         </div>
 
@@ -243,15 +248,17 @@ export function Studio() {
             <div className="flex flex-wrap items-center gap-2">
               <select
                 className="input w-32"
-                value={parts.freq}
-                onChange={(e) => setParts({ ...parts, freq: e.target.value as Frequency })}
+                value={draftParts.value.freq}
+                onChange={(e) =>
+                  draftParts.onChange({ ...draftParts.value, freq: e.target.value as Frequency })
+                }
               >
                 <option value="daily">每天</option>
                 <option value="weekly">每周</option>
                 <option value="hourly">每隔几小时</option>
               </select>
 
-              {parts.freq === 'hourly' ? (
+              {draftParts.value.freq === 'hourly' ? (
                 <div className="flex items-center gap-1.5">
                   <span className="text-sm text-ink-500">每</span>
                   <input
@@ -259,8 +266,10 @@ export function Studio() {
                     min={1}
                     max={23}
                     className="input w-20"
-                    value={parts.everyNHours}
-                    onChange={(e) => setParts({ ...parts, everyNHours: Number(e.target.value) })}
+                    value={draftParts.value.everyNHours}
+                    onChange={(e) =>
+                      draftParts.onChange({ ...draftParts.value, everyNHours: Number(e.target.value) })
+                    }
                   />
                   <span className="text-sm text-ink-500">小时</span>
                 </div>
@@ -268,27 +277,27 @@ export function Studio() {
                 <input
                   type="time"
                   className="input w-32"
-                  value={parts.time}
-                  onChange={(e) => setParts({ ...parts, time: e.target.value })}
+                  value={draftParts.value.time}
+                  onChange={(e) => draftParts.onChange({ ...draftParts.value, time: e.target.value })}
                 />
               )}
             </div>
 
-            {parts.freq === 'weekly' && (
+            {draftParts.value.freq === 'weekly' && (
               <div className="flex gap-1 mt-2">
                 {[1, 2, 3, 4, 5, 6, 7].map((d) => (
                   <button
                     key={d}
                     onClick={() =>
-                      setParts({
-                        ...parts,
-                        days: parts.days.includes(d)
-                          ? parts.days.filter((x) => x !== d)
-                          : [...parts.days, d].sort(),
+                      draftParts.onChange({
+                        ...draftParts.value,
+                        days: draftParts.value.days.includes(d)
+                          ? draftParts.value.days.filter((x) => x !== d)
+                          : [...draftParts.value.days, d].sort(),
                       })
                     }
                     className={`w-8 h-8 rounded-lg text-xs font-medium transition-colors ${
-                      parts.days.includes(d)
+                      draftParts.value.days.includes(d)
                         ? 'bg-accent-500 text-white'
                         : 'bg-ink-100 text-ink-500 hover:bg-ink-200'
                     }`}
@@ -300,11 +309,11 @@ export function Studio() {
             )}
 
             <div className="text-[11px] text-ink-500 mt-2">
-              {describeSchedule(parts)} · 下次：{describeNext(settings?.nextRun?.generate ?? null)}
+              {describeSchedule(draftParts.value)} · 下次：{describeNext(settings?.nextRun?.generate ?? null)}
             </div>
             <details className="text-[11px] text-ink-400 mt-1">
               <summary className="cursor-pointer select-none">crontab 原始表达式</summary>
-              <code className="bg-ink-100 px-1.5 py-0.5 rounded ml-1">{partsToCron(parts)}</code>
+              <code className="bg-ink-100 px-1.5 py-0.5 rounded ml-1">{partsToCron(draftParts.value)}</code>
             </details>
           </div>
           <div>
@@ -314,8 +323,8 @@ export function Studio() {
               min={1}
               max={5}
               className="input"
-              value={perRun}
-              onChange={(e) => setPerRun(Number(e.target.value))}
+              value={draftPerRun.value}
+              onChange={(e) => draftPerRun.onChange(Number(e.target.value))}
             />
             <label className="label mt-3">选题池不足时自动补几条选题</label>
             <div className="flex items-center gap-2">
@@ -324,15 +333,15 @@ export function Studio() {
                 min={0}
                 max={20}
                 className="input w-24"
-                value={ideateCount}
-                onChange={(e) => setIdeateCount(Number(e.target.value))}
-                disabled={!autoIdeate}
+                value={draftIdeateCount.value}
+                onChange={(e) => draftIdeateCount.onChange(Number(e.target.value))}
+                disabled={!draftAutoIdeate.value}
               />
               <button
-                className={autoIdeate ? 'btn-primary' : 'btn-ghost'}
-                onClick={() => setAutoIdeate((v) => !v)}
+                className={draftAutoIdeate.value ? 'btn-primary' : 'btn-ghost'}
+                onClick={() => draftAutoIdeate.onChange(!draftAutoIdeate.value)}
               >
-                {autoIdeate ? '自动补选题：开' : '自动补选题：关'}
+                {draftAutoIdeate.value ? '自动补选题：开' : '自动补选题：关'}
               </button>
             </div>
           </div>
@@ -342,8 +351,9 @@ export function Studio() {
           <label className="label">品牌署名（显示在卡片页脚）</label>
           <input
             className="input"
-            value={brand}
-            onChange={(e) => setBrand(e.target.value)}
+            value={draftBrand.value}
+            onChange={(e) => draftBrand.onChange(e.target.value)}
+            onBlur={draftBrand.onBlur}
             placeholder="留空则不显示"
           />
         </div>
@@ -353,8 +363,8 @@ export function Studio() {
             保存定时设置
           </button>
           <span className="text-xs text-ink-400 flex items-center gap-1.5">
-            <Dot ok={autoCompose} />
-            {autoCompose ? '定时创作运行中' : '定时创作未开启'}
+            <Dot ok={draftAutoCompose.value} />
+            {draftAutoCompose.value ? '定时创作运行中' : '定时创作未开启'}
           </span>
         </div>
       </Card>
@@ -397,7 +407,7 @@ export function Studio() {
         {openTopics.length === 0 ? (
           <Empty>
             选题池是空的。点右上「AI 生成选题」，或手动添加。
-            {autoCompose && ' 定时任务也会在池子空时自动补。'}
+            {draftAutoCompose.value && ' 定时任务也会在池子空时自动补。'}
           </Empty>
         ) : (
           <div className="space-y-1.5 max-h-96 overflow-y-auto">
