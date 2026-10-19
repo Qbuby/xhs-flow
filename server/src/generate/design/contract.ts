@@ -80,18 +80,134 @@ export type AccentStyle = (typeof ACCENT_STYLES)[number];
 /* Schema                                                              */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 账号模板族（template family）。
+ *
+ * 【为什么不能只有一份账号模板】
+ * 同一个账号内部有多套真实版式。source 10 实测（2026-10-17 sharp 扫描）：
+ *   - wow-ip-trend-v1（339）：内页编号是**大号浅蓝** `01`（bbox 69,161 →
+ *     130×186，#D9E9FB），封面是黑字标题 + 蓝底白字强调块 + 2×2 比较矩阵
+ *   - wow-brand-case-v1（340）：内页编号是**细字** `SHIFT · 01`
+ *     （bbox 98,131 → 字面高约 20px、字母间距拉开、纯强调色），封面是
+ *     黑字主题 + 蓝底白字 + 大幅案例配图
+ *
+ * 把两套压成一份「账号模板」，结果是投票互相淘汰 —— 得到的版式原账号
+ * 根本没在用。所以模板按族并存，渲染时选族，不做全局平均。
+ *
+ * `id` 是稳定标识（落库、选版、报告都用它）；`label` 给人看。
+ */
+export const TEMPLATE_FAMILIES = [
+  'wow-ip-trend-v1',
+  'wow-brand-case-v1',
+  'wow-label-dark-v1',
+  'wow-title-top-v1',
+  'wow-blue-tag-v1',
+  'generic-enum-v1',
+] as const;
+export type TemplateFamilyId = (typeof TEMPLATE_FAMILIES)[number];
+
+export const AccountTemplateSchema = z.object({
+  /** 该模板所属的版式族；旧数据无此字段时按文本特征推断。 */
+  family: z.enum(TEMPLATE_FAMILIES).optional().describe('版式族标识：wow-ip-trend-v1 大号浅蓝编号 / wow-brand-case-v1 细字栏目编号 / generic-enum-v1 通用'),
+  cover_header_text: z.string().describe('封面页眉右对齐主行文字；没有则空字符串'),
+  cover_header_sub: z.string().describe('封面页眉右对齐第二行小字；没有则空字符串'),
+  cover_header_bg: z.string().describe('封面页眉底色 #hex'),
+  cover_header_ink: z.string().describe('封面页眉文字色 #hex'),
+  cover_logo_text: z.string().describe('页眉/页脚左侧的品牌 logo 文字（如 WOW）；没有则空字符串'),
+  inner_footer_text: z.string().describe('内页页脚右对齐主行文字；没有则空字符串'),
+  inner_footer_sub: z.string().describe('内页页脚右对齐第二行小字；没有则空字符串'),
+  inner_footer_bg: z.string().describe('内页页脚底色 #hex'),
+  inner_footer_ink: z.string().describe('内页页脚文字色 #hex'),
+  accent: z.string().describe('内容强调色 #hex'),
+  numbering: z.string().describe('编号样式：内页左上大号浅蓝序号（如 01）则填 "01"；无则 "none"'),
+  columns: z.number().int().min(1).max(4).describe('内页常见分栏数'),
+  /**
+   * 图形 Logo 资产（相对 server/assets/ 的路径），有证据才填。
+   *
+   * 为什么必须有：WOW 的图形 logo（斜切 W、O 上的缺口）用普通粗体字
+   * 根本画不出来 —— 模型/字体都只是"像"。原账号 logo 从语料原图裁切、
+   * 抠成透明底后按原图标称尺寸摆放，才是 1:1。没有资产时渲染端
+   * 退回文字 logo（视觉近似，但验收会标注 logo_textual）。
+   */
+  logo_asset_dark: z.string().optional().describe('深色前景 logo（用于浅色底）的资产路径'),
+  logo_asset_light: z.string().optional().describe('浅色前景 logo（用于深色底）的资产路径'),
+  /** 页脚条实测高度 px；蒸馏端用 sharp 扫描原图得出（原账号 127）。 */
+  footer_bar_height: z.number().int().min(80).max(220).optional().describe('内页页脚条实测高度 px'),
+  /** 页眉条实测高度 px（原账号 128）。 */
+  header_bar_height: z.number().int().min(60).max(220).optional().describe('封面页眉条实测高度 px'),
+  /**
+   * 编号前缀标签（如 "SHIFT"）。原图 340 的内页编号是 `SHIFT · 01`：
+   * 细字 + 强调色 + 字间距，不是数字。只有 339 那样纯数字时留空。
+   */
+  numbering_prefix: z.string().optional().describe('编号前缀（如 SHIFT）；纯数字编号留空'),
+  /** 该族内页正文首行的起始 y（实测），用于标题对位。 */
+  inner_body_top: z.number().int().min(80).max(600).optional().describe('内页正文区起始 y px（实测）'),
+});
+export type AccountTemplate = z.infer<typeof AccountTemplateSchema>;
+
+export const DEFAULT_ACCOUNT_TEMPLATE: AccountTemplate = {
+  family: 'generic-enum-v1',
+  cover_header_text: '',
+  cover_header_sub: '',
+  cover_header_bg: '#FFFFFF',
+  cover_header_ink: '#111827',
+  cover_logo_text: '',
+  inner_footer_text: '',
+  inner_footer_sub: '',
+  inner_footer_bg: '#111827',
+  inner_footer_ink: '#FFFFFF',
+  accent: '',
+  numbering: 'none',
+  columns: 1,
+};
+
+/**
+ * 模板族 → 编号渲染形态。
+ *
+ * `big-number`    = 大号浅蓝数字（wow-ip-trend-v1，339 实测）
+ * `label-accent`  = 细字「前缀 · 数字」，强调色 + 通栏横线（wow-brand-case-v1，340 实测）
+ * `label-dark`    = 细字「前缀 · 数字」，**深灰**正文色、无横线（wow-label-dark-v1，
+ *                   351/366/372 实测：`05 — TAKEAWAY`、bbox x98,y153 附近、颜色 #333）
+ * `none`          = 不画编号（wow-title-top-v1：这一族的内页**没有页码**，
+ *                   顶部 y≈153 直接是标题行，条目序号在正文里 —— 342/1 实测）
+ *
+ * 编号是**族特征**，不能跨族复用：把细字画成大号浅蓝、或把深灰细字画成
+ * 强调蓝横线版，都是原账号从未出现过的版式。
+ *
+ * 第三族是 2026-10-19 全量提取（664 页）时从 unknown 队列里校准出来的：
+ * 它的位置与 brand-case 相同、字距相同，**只有颜色不同** —— 说明「编号形态」
+ * 与「编号颜色」是两个独立维度，之前把它们捆在一起才导致漏判。
+ */
+export const FAMILY_NUMBERING = {
+  'wow-ip-trend-v1': 'big-number',
+  'wow-brand-case-v1': 'label-accent',
+  'wow-label-dark-v1': 'label-dark',
+  'wow-title-top-v1': 'none',
+  'wow-blue-tag-v1': 'blue-tag',
+  'generic-enum-v1': 'none',
+} as const satisfies Record<TemplateFamilyId, string>;
+
+export type NumberingStyle = (typeof FAMILY_NUMBERING)[TemplateFamilyId];
+
+/**
+ * 账号 chrome 条的**兜底**几何（模板没带实测值时用）。
+ *
+ * 众数来自 source 10 原始内页的 sharp 行扫描：页脚条上边界 y=1311–1313 →
+ * 高 122–128，取 127；页眉同理取 128。模板自带 footer_bar_height /
+ * header_bar_height 时以模板为准（实测优先于兜底）。
+ */
+export const HEADER_BAR_HEIGHT = 128;
+export const FOOTER_BAR_HEIGHT = 127;
+
 export const DesignContractSchema = z.object({
   theme: z.enum(THEMES).describe('视觉语言：still-paper 静纸 / signal-proof 实证 / bridge-canvas 图桥'),
-  palette_index: z
-    .number()
-    .int()
-    .min(0)
-    .describe('从该主题的固定色板组里选第几套（越界会自动取模）'),
+  palette_index: z.number().int().min(0).describe('从该主题的固定色板组里选第几套（越界会自动取模）'),
   type_scale: z.enum(TYPE_SCALES).describe('字号阶梯：compact 紧凑 / standard 标准 / display 展示级'),
   density: z.enum(DENSITIES).describe('密度：airy 留白多 / standard / dense 信息密集'),
   texture: z.enum(TEXTURES).describe('纹理层，建议按主题给的可选项里挑'),
   motifs: z.array(z.enum(MOTIFS)).describe('装饰件，0-3 个即可，不要堆'),
   accent_style: z.enum(ACCENT_STYLES).describe('强调词的处理方式'),
+  account_template: AccountTemplateSchema.optional().describe('从真实配图蒸馏出的账号固定视觉模板'),
 });
 
 export type DesignContract = z.infer<typeof DesignContractSchema>;
@@ -115,8 +231,7 @@ export {
   THEMES as THEME_IDS,
 };
 
-/** 还没生成画像时的默认契约。 */
-export const DEFAULT_CONTRACT: DesignContract = {
+/** 还没生成画像时的默认契约。 */export const DEFAULT_CONTRACT: DesignContract = {
   theme: 'still-paper',
   palette_index: 0,
   type_scale: 'standard',
@@ -194,11 +309,126 @@ export interface ResolvedSpec {
   texture: Texture;
   motifs: Motif[];
   accentStyle: AccentStyle;
+  /**
+   * 账号固定视觉模板（有蒸馏证据才存在）。
+   *
+   * 之前它只躺在 `contract.account_template` 里，编号样式与分栏数
+   * 从不进任何渲染路径。提到顶层后，布局层（layouts.ts）可以直接读
+   * `spec.accountTemplate.columns` / `.numbering`，渲染端才有生产者。
+   */
+  accountTemplate: AccountTemplate;
 }
 
 /* ------------------------------------------------------------------ */
 /* 兜底                                                                */
 /* ------------------------------------------------------------------ */
+
+/** 非法 hex → null；合法则归一成大写 #RRGGBB。 */
+export function normalizeHex(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  const m = /^#?([0-9a-f]{6})$/i.exec(v.trim());
+  return m?.[1] ? `#${m[1].toUpperCase()}` : null;
+}
+
+/**
+ * 收敛账号视觉模板。
+ *
+ * 【为什么必须有】profile.ts 的聚合 prompt 要求模型产出这个对象，但模型
+ * 会给「白色」「rgb(255,255,255)」这类非法色值 —— 直接放行的话渲染端
+ * 会把 `background:white` 写进 style 里，整条 CSS 失效。这里逐字段校验，
+ * 有证据才收，没有任何字段能收就返回 undefined（调用方走默认回退）。
+ *
+ * 部分合法也**尽量保留**：比如页眉字段齐全、页脚缺失时，页眉仍值得渲染。
+ */
+export function coerceAccountTemplate(raw: unknown): AccountTemplate | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const o = raw as Record<string, unknown>;
+
+  const str = (v: unknown, max: number): string | null => {
+    if (typeof v !== 'string') return null;
+    const s = v.trim().replace(/\s+/g, ' ');
+    return s.length > 0 ? s.slice(0, max) : null;
+  };
+  const num = (v: unknown): number | null => {
+    const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN;
+    return Number.isFinite(n) && Number.isInteger(n) && n >= 1 && n <= 4 ? n : null;
+  };
+
+  const coverText = str(o.cover_header_text, 60);
+  const coverSub = str(o.cover_header_sub, 60);
+  const coverLogo = str(o.cover_logo_text, 20);
+  const footerText = str(o.inner_footer_text, 60);
+  const footerSub = str(o.inner_footer_sub, 60);
+  const accent = normalizeHex(o.accent);
+  const numbering =
+    typeof o.numbering === 'string'
+      ? ['none', '①', '№'].includes(o.numbering.trim()) || /^\d{2}$/.test(o.numbering.trim())
+        ? o.numbering.trim()
+        : null
+      : null;
+  const columns = num(o.columns);
+
+  // 资产路径：只接受 assets/ 下的相对路径，防路径穿越。
+  const assetPath = (v: unknown): string | null => {
+    if (typeof v !== 'string') return null;
+    const s = v.trim();
+    return /^assets\/[\w\-./]+\.png$/.test(s) ? s : null;
+  };
+  const barHeight = (v: unknown): number | null => {
+    const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN;
+    return Number.isFinite(n) && Number.isInteger(n) && n >= 60 && n <= 220 ? n : null;
+  };
+  const logoDark = assetPath(o.logo_asset_dark);
+  const logoLight = assetPath(o.logo_asset_light);
+  const headerH = barHeight(o.header_bar_height);
+  const footerH = barHeight(o.footer_bar_height);
+  const innerBodyTop = (v: unknown): number | null => {
+    const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN;
+    return Number.isFinite(n) && Number.isInteger(n) && n >= 80 && n <= 600 ? n : null;
+  };
+  const bodyTop = innerBodyTop(o.inner_body_top);
+  const prefix = str(o.numbering_prefix, 16);
+
+  // 族标识：显式值优先；旧数据没这字段时按编号形态推断 ——
+  // 有前缀（SHIFT·01 型）→ brand-case；纯数字大号 → ip-trend。
+  // 判不出就落 generic，不硬套品牌族（错族比不套更糟）。
+  const familyRaw = typeof o.family === 'string' ? o.family.trim() : '';
+  const family: TemplateFamilyId =
+    (TEMPLATE_FAMILIES as readonly string[]).includes(familyRaw)
+      ? (familyRaw as TemplateFamilyId)
+      : prefix
+        ? 'wow-brand-case-v1'
+        : numbering === 'none'
+          ? 'generic-enum-v1'
+          : 'wow-ip-trend-v1';
+
+  // 一处真实证据都没有就不产出模板 —— 调用方回落到默认（无页眉无页脚）。
+  if (!coverText && !footerText && !accent && !numbering && !columns) return undefined;
+
+  return {
+    family,
+    cover_header_text: coverText ?? '',
+    cover_header_sub: coverSub ?? '',
+    cover_header_bg: normalizeHex(o.cover_header_bg) ?? DEFAULT_ACCOUNT_TEMPLATE.cover_header_bg,
+    cover_header_ink: normalizeHex(o.cover_header_ink) ?? DEFAULT_ACCOUNT_TEMPLATE.cover_header_ink,
+    cover_logo_text: coverLogo ?? '',
+    inner_footer_text: footerText ?? '',
+    inner_footer_sub: footerSub ?? '',
+    inner_footer_bg: normalizeHex(o.inner_footer_bg) ?? DEFAULT_ACCOUNT_TEMPLATE.inner_footer_bg,
+    inner_footer_ink: normalizeHex(o.inner_footer_ink) ?? DEFAULT_ACCOUNT_TEMPLATE.inner_footer_ink,
+    // accent 没有证据就保持空 —— 空表示"无账号强调色"，渲染端回落主题色板。
+    // 之前默认 '#007CFE' 会让无模板账号也被蓝色污染（无证据字段伪装成有证据）。
+    accent: accent ?? '',
+    numbering: numbering ?? DEFAULT_ACCOUNT_TEMPLATE.numbering,
+    columns: columns ?? DEFAULT_ACCOUNT_TEMPLATE.columns,
+    ...(logoDark ? { logo_asset_dark: logoDark } : {}),
+    ...(logoLight ? { logo_asset_light: logoLight } : {}),
+    ...(headerH ? { header_bar_height: headerH } : {}),
+    ...(footerH ? { footer_bar_height: footerH } : {}),
+    ...(prefix ? { numbering_prefix: prefix } : {}),
+    ...(bodyTop ? { inner_body_top: bodyTop } : {}),
+  };
+}
 
 /**
  * 把任意输入收成一个合法契约。
@@ -221,6 +451,11 @@ export function coerceContract(raw: unknown): DesignContract {
     .filter((m): m is Motif => (MOTIFS as readonly string[]).includes(m))
     .slice(0, 3);
 
+  // account_template 必须穿过这条兜底 —— 之前只重建 7 个枚举字段，
+  // 蒸馏/聚合产出的账号模板在这里被静默丢弃，渲染端拿不到（证据见
+  // normalizeContract 的运行时断言：带完整模板输入 → account_template === null）。
+  const account_template = coerceAccountTemplate(o.account_template);
+
   return {
     theme: pick(o.theme, THEMES, DEFAULT_CONTRACT.theme),
     palette_index: Number.isFinite(indexRaw) && indexRaw >= 0 ? Math.floor(indexRaw) : 0,
@@ -229,5 +464,6 @@ export function coerceContract(raw: unknown): DesignContract {
     texture: pick(o.texture, TEXTURES, DEFAULT_CONTRACT.texture),
     motifs: motifs.length > 0 ? motifs : [...DEFAULT_CONTRACT.motifs],
     accent_style: pick(o.accent_style, ACCENT_STYLES, DEFAULT_CONTRACT.accent_style),
+    ...(account_template ? { account_template } : {}),
   };
 }

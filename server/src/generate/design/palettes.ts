@@ -131,6 +131,23 @@ const SIGNAL_PAPER_PALETTES: Palette[] = [
     tint: '#F1EBD6',
     deep: '#28251A',
   },
+  {
+    /**
+     * 亮蓝。白底 + 亮蓝强调块 + 黑底页脚条。
+     *
+     * 给「咨询 / 方法论 / 品牌策略」这类内容用的 —— 它们的真实图片是
+     * 白底卡片、蓝色标题色块（如 #007CFE）、底部黑条白字的页脚。
+     * 之前三套主题里没有这个组合：静纸全是暖色、实证的档案蓝是深蓝、
+     * 图桥全是暗底。所以这类语料无论证据怎么给，模型都选不出对的色板。
+     */
+    name: '亮蓝',
+    bg: '#FFFFFF',
+    ink: '#111827',
+    inkSoft: '#5B6472',
+    accent: '#007CFE',
+    tint: '#EAF3FF',
+    deep: '#0F172A',
+  },
 ];
 
 const BRIDGE_CANVAS_PALETTES: Palette[] = [

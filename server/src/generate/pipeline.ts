@@ -8,6 +8,8 @@ import { MEDIA_DIR } from '../config.js';
 import { renderCards, toResolved, CARD_WIDTH, type Card, type Layout, LAYOUTS } from './cards.js';
 import { maxTitleLines, type ResolvedSpec } from './design/index.js';
 import { stripEmoji } from '../util/text.js';
+import { productionGate } from '../visual/templates/registry.js';
+import { EXTRACTOR_VERSION } from '../visual/evidence/extract.js';
 import path from 'node:path';
 
 /* ------------------------------------------------------------------ */
@@ -383,7 +385,19 @@ function coerceDraft(raw: Draft): Draft {
   return { title, body, tags, cards };
 }
 
-/** 渲染某草稿的全部卡片并回写路径。 */
+/**
+ * 渲染某草稿的全部卡片并回写路径。
+ *
+ * 【阶段 D 的生产闸门】
+ * 复刻渲染必须挂在一个**已验证的模板族**上。`renderDraftCards` 在
+ * `sourceId` 存在时先问注册表：该来源有没有通过原文回放验收的族？
+ *   - 有 → 用最大 verified 族渲染（复刻模式）
+ *   - 无 → **阻断**：清空本稿的图片路径并写明原因，绝不静默退回通用主题
+ *     后继续标注「1:1 复刻」。报告 5.4 的硬要求。
+ *
+ * 阻断不是失败回滚：草稿与文案照常留在库里，用户看得到内容，
+ * 只是不会拿到「看起来没问题但其实不是那个模板」的图。
+ */
 export async function renderDraftCards(draftId: number, sourceId: number | null): Promise<number> {
   const rows = all<{ id: number; layout: string; content: string; photo_url: string | null }>(
     'SELECT id, layout, content, photo_url FROM draft_cards WHERE draft_id = ? ORDER BY idx',
@@ -391,7 +405,26 @@ export async function renderDraftCards(draftId: number, sourceId: number | null)
   );
 
   const outputDir = path.join(MEDIA_DIR, 'drafts', String(draftId));
-  const cards: Card[] = rows.map((r) => {
+
+  // 生产闸门
+  if (sourceId) {
+    const gate = productionGate(sourceId, EXTRACTOR_VERSION);
+    if (gate.kind === 'blocked') {
+      logger.warn({ sourceId, draftId, reason: gate.reason }, '模板未验证，阻断渲染');
+      run("UPDATE draft_cards SET image_path = NULL WHERE draft_id = ?", draftId);
+      run("UPDATE drafts SET rendered = 0, updated_at = datetime('now') WHERE id = ?", draftId);
+      run(
+        `INSERT INTO events(ts, kind, severity, message, detail)
+         VALUES (datetime('now'), 'fallback', 'warn', ?, ?)`,
+        '模板未验证，已阻断卡片渲染',
+        gate.reason,
+      );
+      return 0;
+    }
+    logger.info({ sourceId, draftId, note: gate.note }, '复刻渲染（已验证模板族）');
+  }
+
+  const cards: Card[] = rows.map((r, i) => {
     let blocks: Record<string, unknown> = {};
     try {
       blocks = JSON.parse(r.content) as Record<string, unknown>;
@@ -399,7 +432,9 @@ export async function renderDraftCards(draftId: number, sourceId: number | null)
       /* 内容坏了就渲染成空卡 */
     }
     if (!blocks.photoQuery && r.photo_url) blocks.photoQuery = r.photo_url;
-    return { layout: r.layout as Layout, blocks };
+    // 卡片序号跟随落库的 idx：编号样式为 "01" 的账号模板渲染成 01/02/03…。
+    // 之前渲染端拿不到顺序，页码兜底恒为 '01'。
+    return { layout: r.layout as Layout, blocks, index: i };
   });
 
   const paths = await renderCards(cards, { sourceId, outputDir });

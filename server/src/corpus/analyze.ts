@@ -4,7 +4,7 @@ import { chatJson } from '../llm/client.js';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
 import { cjkRatio, countEmoji } from '../util/text.js';
-import { asTemplate } from './schema-template.js';
+import { prepareVisionImages } from '../llm/vision.js';
 
 /**
  * 单篇笔记的结构化蒸馏。
@@ -51,6 +51,34 @@ export const NoteStyleSchema = z.object({
     cover_pattern: z.string().describe('封面图的套路'),
     image_role: z.string().describe('图片承担什么作用：信息补充/情绪渲染/纯排版'),
     text_density: z.string().describe('图片上文字量：密集/适中/极少'),
+    /**
+     * 账号固定视觉模板的四项证据。
+     *
+     * 之前 prompt 要求模型看「页眉、页脚、编号、分栏」，但 schema 里根本没有
+     * 对应字段 —— 证据在模型那里就被丢了，聚合端（profile.ts）无据可依，
+     * account_template 也就成了无源之水。这四个字段就是那四条证据的落点：
+     * 后面的聚合 prompt 按「字段 + 出现篇数」统计，出现 ≥2 篇才可信。
+     */
+    cover_header: z
+      .object({
+        present: z.boolean().describe('封面顶部是否有一条固定的品牌页眉'),
+        text: z.string().describe('页眉右对齐主行文字（大字，如 WOW Culture Media Co., Ltd），逐字抄写；没有就空字符串'),
+        sub: z.string().describe('页眉右对齐第二行小字（如 新媒体各渠道电商代运营服务 专业0-1 成功案例100+），逐字抄写；没有就空字符串'),
+        logo: z.string().describe('页眉左侧的品牌 logo 文字（如 WOW）；纯图形画不出来就空字符串'),
+        bg: z.string().describe('页眉底色 #hex，如 #FFFFFF；没有就空字符串'),
+      })
+      .describe('封面页眉证据'),
+    inner_footer: z
+      .object({
+        present: z.boolean().describe('内页底部是否有一条固定的品牌页脚条'),
+        text: z.string().describe('页脚右对齐主行文字（大字），逐字抄写；没有就空字符串'),
+        sub: z.string().describe('页脚右对齐第二行小字，逐字抄写；没有就空字符串'),
+        logo: z.string().describe('页脚左侧的品牌 logo 文字；没有就空字符串'),
+        bg: z.string().describe('页脚条底色 #hex，如 #333333；没有就空字符串'),
+      })
+      .describe('内页页脚证据'),
+    numbering: z.string().describe('内页左上角大号浅蓝序号（01/02/03 逐张递增，封面无编号）；无则写 无'),
+    columns: z.string().describe('内页正文常见分栏数：1/2/3 栏'),
   }),
   observations: z.array(z.string()).describe('这篇里值得复用的 3 个具体手法'),
 });
@@ -148,7 +176,16 @@ const ANALYZE_EXAMPLE = `{
   "language": { "tone": ["克制理性"], "person": "第二人称", "signature_phrases": ["真实措辞"], "rhetoric": ["对比"], "emoji_top": ["🔥"] },
   "hashtags": { "strategy": "大词引流 + 精准长尾", "has_large_traffic_tag": true },
   "cta": { "has_cta": true, "form": "评论区提问" },
-  "visual": { "layout_hypothesis": "大字报/实拍图+贴纸/纯截图", "cover_pattern": "封面套路", "image_role": "信息补充/情绪渲染", "text_density": "密集/适中/极少" },
+  "visual": {
+    "layout_hypothesis": "大字报/实拍图+贴纸/纯截图",
+    "cover_pattern": "封面套路",
+    "image_role": "信息补充/情绪渲染",
+    "text_density": "密集/适中/极少",
+    "cover_header": { "present": true, "text": "逐字抄的主行文字", "sub": "逐字抄的第二行小字", "logo": "WOW", "bg": "#FFFFFF" },
+    "inner_footer": { "present": true, "text": "逐字抄的主行文字", "sub": "逐字抄的第二行小字", "logo": "WOW", "bg": "#333333" },
+    "numbering": "01、02、03 递增 / ①② / 无",
+    "columns": "1/2/3"
+  },
   "observations": ["手法1", "手法2", "手法3"]
 }`;
 
@@ -158,11 +195,20 @@ const ANALYZE_SYSTEM = `你是一位小红书内容策略分析师，拆解真�
 1. 只描述这篇里**真实看到**的；看不到就写"这篇未体现"，绝不脑补。
 2. 公式要能直接套用，不要写"标题很有吸引力"这种形容词。
 3. 客观指标（字数、emoji 数、主色板）以程序统计为准。
+4. visual.cover_header / visual.inner_footer / numbering / columns 只看图片本身：
+   页眉 = 封面**顶部**固定出现的品牌区：左侧一个品牌 logo + 右侧**两行右对齐文字**
+   （第一行大字如「WOW Culture Media Co., Ltd」，第二行小字如
+   「新媒体各渠道电商代运营服务 专业0-1 成功案例100+」）。页脚 = 内页**底部**
+   的固定横条（常见深色条），结构相同：左 logo + 右两行。两行都要**逐字抄**，
+   抄不出第二行/.logo 就留空串，绝不编。底色 #hex（页眉是白底就写 #FFFFFF），
+   看不到就 present=false、全部留空。编号指**内页左上角**大号浅蓝序号
+   （封面无编号、第一张内页是 01、逐张递增）；分栏指内页正文排成几栏。
 
 【输出格式】按下面这份**范例**的结构输出，字段名固定，值换成你这篇的内容：
 ${ANALYZE_EXAMPLE}
 
-【硬性限长】每个字符串字段不超过 25 字，数组每项不超过 15 字。
+【硬性限长】除 cover_header.text / inner_footer.text（≤30 字，逐字抄写）外，
+每个字符串字段不超过 25 字，数组每项不超过 15 字。
 直接给结论，不要展开分析过程。只输出 JSON 对象本身，不要代码块围栏。`;
 
 /**
@@ -200,6 +246,26 @@ function coerceNoteStyle(raw: unknown): NoteStyle {
   if (fix.hashtags) fix.hashtags = { ...fix.hashtags, has_large_traffic_tag: bool(fix.hashtags.has_large_traffic_tag) };
   if (fix.cta) fix.cta = { ...fix.cta, has_cta: bool(fix.cta.has_cta) };
 
+  // visual 的模板四项是后加的字段 —— 模型可能整体漏掉、可能把 present 写成
+  // “是/否”、可能只给了一半子字段。这里补形状，别让整篇蒸馏卡在 schema 上。
+  if (fix.visual) {
+    fix.visual = { ...fix.visual };
+    const normBar = (raw: unknown): { present: boolean; text: string; sub: string; logo: string; bg: string } => {
+      const o = (raw ?? {}) as Record<string, unknown>;
+      return {
+        present: bool(o.present) ?? false,
+        text: typeof o.text === 'string' ? o.text.trim().slice(0, 40) : '',
+        sub: typeof o.sub === 'string' ? o.sub.trim().slice(0, 40) : '',
+        logo: typeof o.logo === 'string' ? o.logo.trim().slice(0, 20) : '',
+        bg: typeof o.bg === 'string' ? o.bg.trim().slice(0, 20) : '',
+      };
+    };
+    fix.visual.cover_header = normBar(fix.visual.cover_header);
+    fix.visual.inner_footer = normBar(fix.visual.inner_footer);
+    fix.visual.numbering = typeof fix.visual.numbering === 'string' ? fix.visual.numbering.trim().slice(0, 25) : '';
+    fix.visual.columns = typeof fix.visual.columns === 'string' ? fix.visual.columns.trim().slice(0, 25) : '';
+  }
+
   const parsed = NoteStyleSchema.safeParse(fix);
   if (parsed.success) return parsed.data;
 
@@ -219,17 +285,33 @@ export async function analyzeNote(notePk: number): Promise<NoteStyle> {
     notePk,
   );
 
+  const imagePaths = images.map((image) => image.local_path).filter((path): path is string => Boolean(path));
+  const { images: visionImages, failed: visionFailed } = await prepareVisionImages(imagePaths);
+  // 图片准备失败（文件缺失/解码失败/超预算）不再静默：日志要能回答
+  // 「模型为什么没看到页眉 —— 是没看到，还是图根本没送上去」。
+  if (visionFailed > 0) {
+    logger.warn({ notePk, visionFailed, total: imagePaths.length }, '部分配图未能进入视觉模型负载');
+  }
   const user = [
     '请拆解下面这篇小红书笔记，按 JSON schema 输出。',
     '',
     buildContext(note, images),
     '',
-    '注意：visual 字段只能依据上面给出的图片客观信息和正文描述来推断，不要编造看不见的画面细节。',
+    visionImages.length
+      ? `已附上 ${visionImages.length} 张真实配图（按原顺序：第 1 张通常是封面，其余是内页）。` +
+        `visual 必须以这些图片中实际看到的为准，并**逐张检查页眉、页脚、编号、分栏**：\n` +
+        `- cover_header：封面顶部的品牌区 = 左侧 logo 文字 + 右侧**两行右对齐文字**（大字主行 + 小字副行），全部逐字抄；白底也写 bg=#FFFFFF。\n` +
+        `- inner_footer：内页底部的固定横条 = 左 logo + 右两行（主行 + 副行），同样逐字抄 + #hex。\n` +
+        `- numbering：内页**左上角**的大号浅蓝序号（封面无编号、第一张内页是 01、逐张递增）；没有就写 无。\n` +
+        `- columns：数内页正文分几栏。\n` +
+        `其余 visual 字段也以图片为准；看不到就写“未体现”。`
+      : '本次没有可用配图。visual 只能写“未体现”，不要根据正文猜测画面。',
   ].join('\n');
 
   const style = await chatJson<NoteStyle>({
     system: ANALYZE_SYSTEM,
     user,
+    images: visionImages,
     temperature: 0.3,
     maxTokens: 16_384,
   });
@@ -277,9 +359,15 @@ async function pooled<T, R>(
 export async function analyzeSource(
   sourceId: number,
   limit = 60,
+  /**
+   * 进度回调。传了就往 job_progress 里写，界面才能画进度条 ——
+   * 这一批可能跑十几分钟，中间没有任何反馈的话，用户没法区分
+   * 「正在跑」和「卡死了」，只会反复点按钮。
+   */
+  onProgress?: (p: { done: number; failed: number; total: number; noteId: number; noteTitle: string }) => void,
 ): Promise<{ done: number; failed: number; reasons: string[] }> {
-  const pending = all<{ id: number }>(
-    `SELECT n.id FROM notes n
+  const pending = all<{ id: number; title: string }>(
+    `SELECT n.id, n.title FROM notes n
      LEFT JOIN note_styles ns ON ns.note_id = n.id
      WHERE n.source_id = ? AND ns.note_id IS NULL
      ORDER BY n.published_at DESC
@@ -296,24 +384,37 @@ export async function analyzeSource(
   );
 
   const reasons: string[] = [];
+  // 并发跑，所以计数是边跑边加的（不是最后一次性统计）——
+  // 后者会让进度条在跑完之前一直停在 0%。
   let done = 0;
   let failed = 0;
 
   const results = await pooled(pending, CONCURRENCY, async (row) => {
     try {
       await analyzeNote(row.id);
+      done++;
+      onProgress?.({
+        done,
+        failed,
+        total: pending.length,
+        noteId: row.id,
+        noteTitle: row.title,
+      });
       return 'ok' as const;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (reasons.length < 3) reasons.push(msg.slice(0, 240));
+      failed++;
+      onProgress?.({
+        done,
+        failed,
+        total: pending.length,
+        noteId: row.id,
+        noteTitle: row.title,
+      });
       return { error: msg } as const;
     }
   });
-
-  for (const r of results) {
-    if (r === 'ok') done++;
-    else failed++;
-  }
 
   if (failed > 0) {
     const sample = results.find((r) => r !== 'ok');

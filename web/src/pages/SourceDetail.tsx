@@ -23,6 +23,34 @@ interface Detail {
   styleProfile: StyleProfile | null;
   cardSpec: Record<string, unknown>;
   design: DesignInfo | null;
+  /**
+   * 最近一次蒸馏作业。
+   *
+   * 为什么必须单独给：下面那个 `stats.styled` 是**历史累计**（曾经成功过
+   * 多少篇），跟「这一批成没成」毫无关系。模型名过期那三天它一直显示
+   * 98%，而实际每批都是 0 成功 —— 界面在骗人。
+   */
+  distill: DistillInfo | null;
+}
+
+interface DistillProgress {
+  jobId: number;
+  phase: 'distill' | 'profile';
+  done: number;
+  failed: number;
+  total: number;
+  noteId: number | null;
+  noteTitle: string | null;
+  updatedAt: string;
+}
+
+interface DistillInfo {
+  jobId: number;
+  status: 'pending' | 'running' | 'done' | 'failed' | 'canceled' | string;
+  error: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  progress: DistillProgress | null;
 }
 
 interface StyleProfile {
@@ -76,6 +104,119 @@ interface NoteDetail {
   note: { id: number; title: string; desc: string; tags: string; liked_count: number };
   images: Array<{ id: number; local_path: string | null; palette: string | null }>;
   style: unknown;
+}
+
+/**
+ * 把蒸馏失败原因翻译成人话。
+ *
+ * 服务端抛的是整段拼接（含各家网关的 JSON），直接甩给用户等于没提示。
+ * 这里只挑出**能据此采取行动**的那一条 —— 因为这几类的原因要做的
+ * 事完全不同：404/403 去改模型名，429/529 等一会重试，网络错误查配置。
+ */
+function diagnoseDistillError(raw: string): { headline: string; hint: string } {
+  if (/model_not_found|404/.test(raw)) {
+    const m = /模型\s*'([^']+)'/.exec(raw);
+    return {
+      headline: `模型名不对：${m?.[1] ?? '未知模型'} 在服务端不存在或无权限`,
+      hint: '去设置页确认「模型名」拼写，以及该 key 是否有这个模型的权限。配置改了立刻生效，不用重启服务。',
+    };
+  }
+  if (/overloaded|529|503/.test(raw)) {
+    return {
+      headline: '模型服务过载（上游 529/503）',
+      hint: '这是对方的问题，不是配置错了。等一两分钟再点一次「蒸馏语料」通常就能过。',
+    };
+  }
+  if (/429|rate_limit|too_many_requests/i.test(raw)) {
+    return {
+      headline: '触发限流（429）',
+      hint: '并发或频率太高。稍后重试，连续失败的话可以调低批量。',
+    };
+  }
+  if (/api[_-]?key|401|403|unauthorized/i.test(raw)) {
+    return {
+      headline: '鉴权失败（401/403）',
+      hint: 'API Key 不对、已过期，或没有该模型的权限。去设置页重新填 Key。',
+    };
+  }
+  if (/ECONNREFUSED|ENOTFOUND|fetch failed|getaddrinfo/i.test(raw)) {
+    return {
+      headline: '连不上模型服务',
+      hint: '检查 Base URL 是否拼对、以及本机网络能否访问。',
+    };
+  }
+  return {
+    headline: '蒸馏失败',
+    hint: '完整报错见下方（也记在数据库 jobs.last_error 里）。',
+  };
+}
+
+/** 蒸馏状态面板：进度 + 失败原因。 */
+function DistillStatus({ info }: { info: DistillInfo | null }) {
+  if (!info) return null;
+  const p = info.progress;
+  const runningNow = info.status === 'running' || info.status === 'pending';
+
+  // 跑完了就把进度行清掉了，这时用作业本身的状态说话。
+  const phaseLabel = p?.phase === 'profile' ? '正在汇总风格画像' : '正在蒸馏笔记';
+  const pct = p && p.total > 0 ? Math.min(100, Math.round(((p.done + p.failed) / p.total) * 100)) : 0;
+
+  return (
+    <div className="mb-4">
+      {runningNow && (
+        <div className="rounded-lg bg-violet-50 border border-violet-200 px-4 py-3 text-sm text-violet-900">
+          <div className="flex items-center justify-between mb-2">
+            <span className="font-medium">{phaseLabel}…</span>
+            <span className="text-violet-700 tabular-nums">
+              {p && p.total > 0 ? `${p.done + p.failed} / ${p.total}` : '准备中'}
+            </span>
+          </div>
+          <div className="h-1.5 rounded-full bg-violet-100 overflow-hidden">
+            <div className="h-full bg-violet-500 transition-all" style={{ width: `${pct}%` }} />
+          </div>
+          {p?.noteTitle && (
+            <div className="mt-2 text-xs text-violet-700 truncate">
+              当前：{p.noteTitle}
+              {p.failed > 0 && <span className="ml-2 text-rose-600">失败 {p.failed} 篇</span>}
+            </div>
+          )}
+        </div>
+      )}
+
+      {!runningNow && info.status === 'failed' && info.error && (
+        <div className="rounded-lg bg-rose-50 border border-rose-200 px-4 py-3 text-sm text-rose-900">
+          <div className="font-medium mb-1">
+            ✗ 上次蒸馏失败（作业 #{info.jobId}）
+          </div>
+          {(() => {
+            const d = diagnoseDistillError(info.error ?? '');
+            return (
+              <>
+                <div className="mb-1">{d.headline}</div>
+                <div className="text-xs text-rose-700">{d.hint}</div>
+                <details className="mt-2">
+                  <summary className="text-xs text-rose-600 cursor-pointer">完整报错</summary>
+                  <pre className="mt-1 text-[11px] leading-relaxed whitespace-pre-wrap break-all text-rose-800 bg-white/60 rounded p-2 max-h-40 overflow-auto">
+                    {info.error}
+                  </pre>
+                </details>
+              </>
+            );
+          })()}
+          <div className="text-xs text-rose-600 mt-2">
+            提示：上方的「已蒸馏」是历史累计数，与这次失败无关。
+          </div>
+        </div>
+      )}
+
+      {!runningNow && info.status === 'done' && (
+        <div className="rounded-lg bg-emerald-50 border border-emerald-200 px-4 py-2 text-sm text-emerald-900">
+          ✓ 上次蒸馏完成
+          {info.finishedAt && <span className="text-emerald-700">（{info.finishedAt}）</span>}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export function SourceDetail() {
@@ -186,6 +327,9 @@ export function SourceDetail() {
   useEffect(() => {
     if (!running) return;
     const t = setInterval(async () => {
+      // 4 秒一次：既要看作业是否结束，也要刷新进度条的数字。
+      // 之前只在「结束」那一刻 load 一次，所以跑十几分钟全程没反馈。
+      void load();
       try {
         const j = await api.get<{ type: string; status: string; last_error: string | null }[]>(
           '/api/jobs',
@@ -260,11 +404,17 @@ export function SourceDetail() {
         }
       />
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-5">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
         <Stat label="笔记总数" value={data.stats.total} />
-        <Stat label="已蒸馏" value={data.stats.styled} hint={data.stats.total ? `${Math.round((data.stats.styled / data.stats.total) * 100)}%` : ''} />
+        <Stat
+          label="已蒸馏（累计）"
+          value={data.stats.styled}
+          hint={data.stats.total ? `${Math.round((data.stats.styled / data.stats.total) * 100)}%` : ''}
+        />
         <Stat label="风格档案" value={p ? '已生成' : '未生成'} />
       </div>
+
+      <DistillStatus info={data.distill} />
 
       {/* 抓取 */}
       <Card className="mb-5">

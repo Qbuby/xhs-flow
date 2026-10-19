@@ -22,6 +22,7 @@ import {
   recentRunLogs,
   setSetting,
   getSetting,
+  getJobProgress,
 } from '../db/index.js';
 import { browser } from '../xhs/browser.js';
 import { scrapeAuthor, listSources } from '../xhs/scrape.js';
@@ -353,6 +354,28 @@ export async function buildServer() {
     // 画像里存的可能是新契约，也可能是库里遗留的旧 18 字段 ——
     // toResolved 两种都吃，顺带把旧的迁移过来。
     const resolved = toResolved(profile?.profile.card_template_spec);
+
+    /**
+     * 最近一次蒸馏作业的状态。
+     *
+     * 之前界面只有一个「已蒸馏 116 / 98%」—— 那是**历史累计**数，
+     * 跟当前这一批成没成毫无关系。模型名过期那三天它一直显示 98%，
+     * 实际每批都是 0 成功（60 篇全部 model_not_found）。
+     * 所以必须把最近一次作业的进度与失败原因原样回传，让界面能说实话。
+     */
+    const lastDistill = get<{
+      id: number;
+      status: string;
+      last_error: string | null;
+      started_at: string | null;
+      finished_at: string | null;
+    }>(
+      `SELECT id, status, last_error, started_at, finished_at FROM jobs
+       WHERE type = 'distill' AND json_extract(payload, '$.sourceId') = ?
+       ORDER BY id DESC LIMIT 1`,
+      id,
+    );
+
     return {
       source,
       stats,
@@ -361,6 +384,16 @@ export async function buildServer() {
       // 前端不再自己读 hex。这里回填的是**归一后的契约**（旧画像读出来
       // 就是迁移后的新契约），并把解析出来的真实色值一起给出去。
       cardSpec: resolved.contract,
+      distill: lastDistill
+        ? {
+            jobId: lastDistill.id,
+            status: lastDistill.status,
+            error: lastDistill.last_error,
+            startedAt: lastDistill.started_at,
+            finishedAt: lastDistill.finished_at,
+            progress: getJobProgress(lastDistill.id),
+          }
+        : null,
       design: {
         theme: resolved.theme,
         paletteName: resolved.palette.name,

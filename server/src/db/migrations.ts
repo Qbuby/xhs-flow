@@ -180,6 +180,69 @@ export const MIGRATIONS: string[] = [
   CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe ON jobs(dedupe_key) WHERE dedupe_key IS NOT NULL;
   `,
 
+  /* ---------- 长任务的进度 ----------
+   * 蒸馏一次要跑 30~60 篇、十几分钟，中间只有一句 logger。
+   * 没有这张表，界面就只能显示「已蒸馏 116 / 98%」这种**历史累计**数字 ——
+   * 看着挺好，其实这一批一篇都没成功过（模型名过期那三天就是这种情况）。
+   *
+   * 所以进度必须落库：job_id 是行键（一个作业一行，跑完删掉）。
+   * done/total 让界面画进度条，note_id/note_title 标出当前在处理哪篇，
+   * phase 区分「蒸馏笔记」与「汇总作者画像」两个阶段 —— 后者是一次
+   * 200 秒量级的调用，之前全程零反馈。
+   */
+  `
+  CREATE TABLE IF NOT EXISTS job_progress (
+    job_id     INTEGER PRIMARY KEY,
+    phase      TEXT NOT NULL DEFAULT 'distill',  -- distill|profile
+    done       INTEGER NOT NULL DEFAULT 0,
+    failed     INTEGER NOT NULL DEFAULT 0,
+    total      INTEGER NOT NULL DEFAULT 0,
+    note_id    INTEGER,
+    note_title TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  `,
+
+  /* ---------- 逐页视觉证据（阶段 C：模板库的生产者）---------- */
+  /*
+   * 为什么单独一张表：note_images 记的是「图片存不存在、有多大」，
+   * 那是抓取产物；这里记的是「这张图属于哪个模板族、几何证据是什么、
+   * 用哪版提取器得到的」—— 那是复刻的生产者。两者生命周期不同：
+   * 图片可以重新抓，模板证据一旦被 golden 引用就不能悄悄变。
+   *
+   * 关键字段：
+   *  - extractor_version：证据的算法版本。提取逻辑改了必须换版本号，
+   *    否则旧行会被当成新证据（之前 palette 的 5bit 打包 bug 就是
+   *    因为没有版本标记，632 行坏数据被当成真值用了很久）。
+   *  - family：分类结果；'unknown' 表示「测不出属于哪族」，进校准队列，
+   *    不硬塞进已知族。
+   *  - evidence：JSON，存该页的像素测量（页脚顶边、编号 bbox、色值…），
+   *    golden 验收直接引用它，测试预期不来自 spec。
+   *  - verified：是否通过了对应族的 golden 验收。0 表示不可用于生产。
+   */
+  `
+  CREATE TABLE IF NOT EXISTS page_evidence (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    image_id      INTEGER NOT NULL REFERENCES note_images(id) ON DELETE CASCADE,
+    source_id     INTEGER NOT NULL,
+    note_id       INTEGER NOT NULL,
+    page_index    INTEGER NOT NULL,
+    sha256        TEXT,               -- 与 note_images.sha256 一致，便于判定「图变了要重提」
+    width         INTEGER,
+    height        INTEGER,
+    family        TEXT NOT NULL DEFAULT 'unknown',
+    confidence    REAL NOT NULL DEFAULT 0,
+    extractor_version TEXT NOT NULL DEFAULT 'v1',
+    evidence      TEXT,               -- JSON：像素测量
+    failure       TEXT,               -- 提取失败原因（unknown 队列用）
+    verified      INTEGER NOT NULL DEFAULT 0,
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(image_id, extractor_version)
+  );
+  CREATE INDEX IF NOT EXISTS idx_page_evidence_source ON page_evidence(source_id, family);
+  CREATE INDEX IF NOT EXISTS idx_page_evidence_note ON page_evidence(note_id, page_index);
+  `,
+
   /* ---------- 运行日志 ---------- */
   `
   CREATE TABLE IF NOT EXISTS run_logs (

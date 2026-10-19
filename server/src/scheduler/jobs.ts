@@ -1,5 +1,16 @@
 import { Cron } from 'croner';
-import { run, get, all, logEvent, recordRunLog, getSetting } from '../db/index.js';
+import {
+  run,
+  get,
+  all,
+  count,
+  logEvent,
+  recordRunLog,
+  getSetting,
+  startJobProgress,
+  updateJobProgress,
+  clearJobProgress,
+} from '../db/index.js';
 import { logger } from '../logger.js';
 import { config } from '../config.js';
 import { scrapeAuthor } from '../xhs/scrape.js';
@@ -86,29 +97,59 @@ const handlers: Record<JobType, Handler> = {
     return res;
   },
 
-  async distill(p) {
+  async distill(p, jobId) {
     if (!p.sourceId) throw new Error('distill 任务缺少 sourceId');
-    const analysis = await analyzeSource(p.sourceId, 60);
 
-    // 作者画像是一次 200 秒量级的大调用，但结果几乎不变。
-    // 只要没有新增笔记、且已有画像，就别重算。
-    const existing = get<{ sample_count: number }>(
-      'SELECT sample_count FROM style_profiles WHERE source_id = ?',
+    // 先占一行进度：从入队那一刻界面就能显示「准备中 / 共 N 篇」，
+    // 否则点完按钮到真正开跑之间有一段空窗，用户会以为没点上。
+    const pendingCount = count(
+      `SELECT COUNT(*) FROM notes n
+       LEFT JOIN note_styles ns ON ns.note_id = n.id
+       WHERE n.source_id = ? AND ns.note_id IS NULL`,
       p.sourceId,
     );
-    const styled = get<{ c: number }>(
-      'SELECT COUNT(*) AS c FROM notes n JOIN note_styles ns ON ns.note_id = n.id WHERE n.source_id = ?',
-      p.sourceId,
-    );
+    startJobProgress(jobId, 'distill', pendingCount);
 
-    let profileBuilt = false;
-    if (!existing || (styled?.c ?? 0) > existing.sample_count + 2) {
-      const profile = await buildStyleProfile(p.sourceId);
-      profileBuilt = Boolean(profile);
-    } else {
-      logger.info({ sourceId: p.sourceId, sample: styled?.c }, '已有风格画像且无新增笔记，跳过重算');
+    try {
+      const analysis = await analyzeSource(p.sourceId, 60, (pr) => {
+        updateJobProgress(jobId, {
+          done: pr.done,
+          failed: pr.failed,
+          noteId: pr.noteId,
+          noteTitle: pr.noteTitle,
+        });
+      });
+      clearJobProgress(jobId);
+
+      // 作者画像是一次 200 秒量级的大调用，但结果几乎不变。
+      // 只要没有新增笔记、且已有画像，就别重算。
+      const existing = get<{ sample_count: number }>(
+        'SELECT sample_count FROM style_profiles WHERE source_id = ?',
+        p.sourceId,
+      );
+      const styledCount = count(
+        'SELECT COUNT(*) FROM notes n JOIN note_styles ns ON ns.note_id = n.id WHERE n.source_id = ?',
+        p.sourceId,
+      );
+
+      let profileBuilt = false;
+      if (!existing || styledCount > existing.sample_count + 2) {
+        // 单独开一个 phase：笔记全蒸馏完但画像还在算时，
+        // 界面应该说「在汇总风格画像」，而不是停在 100% 让人以为收工了。
+        startJobProgress(jobId, 'profile', 1);
+        const profile = await buildStyleProfile(p.sourceId);
+        profileBuilt = Boolean(profile);
+      } else {
+        logger.info({ sourceId: p.sourceId, sample: styledCount }, '已有风格画像且无新增笔记，跳过重算');
+      }
+      clearJobProgress(jobId);
+      return { ...analysis, profileBuilt, profileSkipped: !profileBuilt };
+    } catch (err) {
+      // 失败时保留最后一行进度：界面要能显示「停在第 12/60 篇、
+      // 失败原因是什么」，而不是退回一个什么都不说的「已蒸馏 98%」。
+      clearJobProgress(jobId);
+      throw err;
     }
-    return { ...analysis, profileBuilt, profileSkipped: !profileBuilt };
   },
 
   async ideate(p) {
@@ -263,6 +304,9 @@ function reclaimOrphanJobs(): number {
   const orphans = all<{ id: number }>(`SELECT id FROM jobs WHERE status = 'running'`);
   if (orphans.length === 0) return 0;
   for (const o of orphans) {
+    // 僵尸任务不可能还在跑，它的进度行是上次崩溃留下的残留，
+    // 不清掉的话界面会一直显示一个永远不动的进度条。
+    clearJobProgress(o.id);
     const row = get<{ attempts: number; max_attempts: number }>(
       'SELECT attempts, max_attempts FROM jobs WHERE id = ?',
       o.id,

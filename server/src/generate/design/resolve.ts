@@ -8,6 +8,7 @@ import {
 } from './palettes.js';
 import {
   coerceContract,
+  DEFAULT_ACCOUNT_TEMPLATE,
   type DesignContract,
   type DensitySpec,
   type Motif,
@@ -139,6 +140,10 @@ export function resolveSpec(raw: unknown): ResolvedSpec {
     texture,
     motifs,
     accentStyle: contract.accent_style,
+    // 有蒸馏证据的账号模板原样透传；没有就回落到默认（页眉/页脚文字为空 → 不渲染）。
+    // 之前 resolveSpec 走 coerceContract 时模型给的模板还在，但返回结构里没有这一层，
+    // 布局层拿不到编号样式与分栏数 —— 两处字段除定义外零消费就是这么来的。
+    accountTemplate: contract.account_template ?? { ...DEFAULT_ACCOUNT_TEMPLATE },
   };
 }
 

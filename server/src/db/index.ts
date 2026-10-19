@@ -43,6 +43,18 @@ export function get<T = Row>(sql: string, ...params: unknown[]): T | undefined {
   return db.prepare(sql).get(...(params as never[])) as T | undefined;
 }
 
+/**
+ * 取第一行第一列的计数。
+ * COUNT(*) 在 node:sqlite 里返回的是 bigint，直接当 number 用会拿到
+ * BigInt，所以在这里统一转掉 —— 否则 `?? 0` 这类兜底判断全部失效。
+ */
+export function count(sql: string, ...params: unknown[]): number {
+  const row = db.prepare(sql).get(...(params as never[])) as Record<string, unknown> | undefined;
+  if (!row) return 0;
+  const v = Object.values(row)[0];
+  return typeof v === 'bigint' ? Number(v) : Number(v ?? 0);
+}
+
 export interface RunResult {
   changes: number;
   lastInsertRowid: number;
@@ -92,6 +104,88 @@ export function setSetting(key: string, value: string): void {
 export function allSettings(): Record<string, string> {
   const rows = all<{ key: string; value: string }>('SELECT key, value FROM settings');
   return Object.fromEntries(rows.map((r) => [r.key, r.value]));
+}
+
+/* ------------------------------------------------------------------ */
+/* 长任务进度                                                           */
+/* ------------------------------------------------------------------ */
+
+export interface JobProgress {
+  jobId: number;
+  phase: 'distill' | 'profile';
+  done: number;
+  failed: number;
+  total: number;
+  noteId: number | null;
+  noteTitle: string | null;
+  updatedAt: string;
+}
+
+type ProgressRow = {
+  job_id: number;
+  phase: string;
+  done: number;
+  failed: number;
+  total: number;
+  note_id: number | null;
+  note_title: string | null;
+  updated_at: string;
+};
+
+function toProgress(r: ProgressRow): JobProgress {
+  return {
+    jobId: r.job_id,
+    phase: (r.phase === 'profile' ? 'profile' : 'distill'),
+    done: r.done,
+    failed: r.failed,
+    total: r.total,
+    noteId: r.note_id,
+    noteTitle: r.note_title,
+    updatedAt: r.updated_at,
+  };
+}
+
+/** 起跑前先占一行，界面才不会在「已入队」和「开始处理」之间出现空窗。 */
+export function startJobProgress(jobId: number, phase: JobProgress['phase'], total: number): void {
+  run(
+    `INSERT INTO job_progress(job_id, phase, done, failed, total, updated_at)
+     VALUES (?, ?, 0, 0, ?, datetime('now'))
+     ON CONFLICT(job_id) DO UPDATE SET
+       phase = excluded.phase, done = 0, failed = 0, total = excluded.total,
+       note_id = NULL, note_title = NULL, updated_at = datetime('now')`,
+    jobId,
+    phase,
+    total,
+  );
+}
+
+export function updateJobProgress(
+  jobId: number,
+  patch: Partial<Pick<JobProgress, 'phase' | 'done' | 'failed' | 'total' | 'noteId' | 'noteTitle'>>,
+): void {
+  const cur = get<ProgressRow>('SELECT * FROM job_progress WHERE job_id = ?', jobId);
+  if (!cur) return;
+  const next = { ...toProgress(cur), ...patch };
+  run(
+    `UPDATE job_progress SET phase=?, done=?, failed=?, total=?, note_id=?, note_title=?,
+     updated_at=datetime('now') WHERE job_id=?`,
+    next.phase,
+    next.done,
+    next.failed,
+    next.total,
+    next.noteId,
+    next.noteTitle,
+    jobId,
+  );
+}
+
+export function clearJobProgress(jobId: number): void {
+  run('DELETE FROM job_progress WHERE job_id = ?', jobId);
+}
+
+export function getJobProgress(jobId: number): JobProgress | null {
+  const r = get<ProgressRow>('SELECT * FROM job_progress WHERE job_id = ?', jobId);
+  return r ? toProgress(r) : null;
 }
 
 /* ------------------------------------------------------------------ */

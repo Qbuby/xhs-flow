@@ -28,9 +28,16 @@ function getOpenAI(baseURL: string, apiKey: string): OpenAI {
   return openaiClient;
 }
 
+export interface ChatImage {
+  mediaType: 'image/jpeg' | 'image/png' | 'image/webp';
+  /** 不含 data URL 前缀的 base64。 */
+  data: string;
+}
+
 export interface ChatOptions {
   system?: string;
   user: string;
+  images?: ChatImage[];
   temperature?: number;
   maxTokens?: number;
   jsonMode?: boolean;
@@ -50,12 +57,19 @@ async function callAnthropic(opts: ChatOptions, maxTokens: number): Promise<Anth
   const base = cfg.baseURL.replace(/\/+$/, '');
   const url = base.endsWith('/v1/messages') ? base : `${base}/v1/messages`;
 
+  const content = [
+    ...(opts.images ?? []).map((image) => ({
+      type: 'image',
+      source: { type: 'base64', media_type: image.mediaType, data: image.data },
+    })),
+    { type: 'text', text: opts.user },
+  ];
   const body = {
     model: cfg.model,
     max_tokens: maxTokens,
     // Anthropic 的 system 是顶层字段，不放进 messages
     ...(opts.system ? { system: opts.system } : {}),
-    messages: [{ role: 'user', content: opts.user }],
+    messages: [{ role: 'user', content: opts.images?.length ? content : opts.user }],
     temperature: opts.temperature ?? 0.8,
     stream: false,
   };
@@ -124,7 +138,18 @@ async function chatOpenAI(opts: ChatOptions): Promise<string> {
   const cfg = getLlmConfig();
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
   if (opts.system) messages.push({ role: 'system', content: opts.system });
-  messages.push({ role: 'user', content: opts.user });
+  messages.push({
+    role: 'user',
+    content: opts.images?.length
+      ? [
+          ...opts.images.map((image) => ({
+            type: 'image_url' as const,
+            image_url: { url: `data:${image.mediaType};base64,${image.data}` },
+          })),
+          { type: 'text' as const, text: opts.user },
+        ]
+      : opts.user,
+  });
 
   const res = await getOpenAI(cfg.baseURL, cfg.apiKey).chat.completions.create({
     model: cfg.model,

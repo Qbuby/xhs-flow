@@ -7,8 +7,11 @@ import { stripEmoji } from '../util/text.js';
 import { logger } from '../logger.js';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { searchStock, toSearchHint } from '../media/stock.js';
 import type { StockImage } from '../media/stock.js';
+import { escapeHtml, highlightHtml } from './card-text.js';
 import {
   DEFAULT_CONTRACT,
   backgroundCss,
@@ -22,6 +25,13 @@ import {
   type ResolvedSpec,
 } from './design/index.js';
 import { layoutBody, motifZone } from './layouts.js';
+import {
+  DEFAULT_ACCOUNT_TEMPLATE,
+  FAMILY_NUMBERING,
+  FOOTER_BAR_HEIGHT,
+  HEADER_BAR_HEIGHT,
+  type AccountTemplate,
+} from './design/contract.js';
 
 /**
  * 卡片渲染器。
@@ -60,6 +70,10 @@ import { layoutBody, motifZone } from './layouts.js';
 export const CARD_WIDTH = 1080;
 export const CARD_HEIGHT = 1440;
 
+// 页眉/页脚条高度常量收进 design/contract.ts（HEADER_BAR_HEIGHT=128、
+// FOOTER_BAR_HEIGHT=126，实测值）；这里 re-export 保持旧引用（diagnostics）可用。
+export { HEADER_BAR_HEIGHT, FOOTER_BAR_HEIGHT } from './design/contract.js';
+
 export const LAYOUTS = ['cover', 'quote', 'list', 'steps', 'compare', 'photo_text', 'cta'] as const;
 export type Layout = (typeof LAYOUTS)[number];
 
@@ -78,6 +92,12 @@ export interface Card {
   blocks: Record<string, unknown>;
   photoUrl?: string;
   imagePath?: string;
+  /**
+   * 卡片在整组图中的序号（0 起）。编号样式为 "01" 时渲染成
+   * `String(index + 1).padStart(2, '0')` —— 第 i 张内页就是 01/02/03…，
+   * 不再恒为 '01'。调用方不给时按 0 处理。
+   */
+  index?: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -115,39 +135,12 @@ export function specForSource(sourceId: number | null): ResolvedSpec {
 /* 文本                                                                */
 /* ------------------------------------------------------------------ */
 
-/** HTML 转义 + 换行转 <br>。 */
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/\r?\n/g, '<br/>');
-}
-
 /**
- * 把模型给的强调标记 `[[词]]` 渲染成 accent 样式的 span。
- *
- * ⚠️ `accent_style: 'none'` 旧实现是坏的 —— 会掉进 else 分支变成高亮。
- * 这里显式处理：`none` 就只去掉标记、不加任何样式。
+ * 文本管线（escapeHtml / highlightHtml / rich / richWith）已经搬进
+ * `card-text.ts` —— layouts.ts 也要用同一套 `[[ ]]` 处理，而 cards.ts
+ * import layouts.ts，反向导出会成环。这里 re-export 保持旧引用可用。
  */
-function highlightHtml(text: string, spec: ResolvedSpec): string {
-  // 先按 [[ ]] 切开，只对非标记段做转义，避免转义把方括号搞乱
-  const parts: string[] = [];
-  let last = 0;
-  const re = /\[\[(.+?)\]\]/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text))) {
-    parts.push(escapeHtml(text.slice(last, m.index)));
-    const inner = escapeHtml(m[1] ?? '');
-    parts.push(inner ? `<span class="hl">${inner}</span>` : '');
-    last = m.index + m[0].length;
-  }
-  parts.push(escapeHtml(text.slice(last)));
-  // 没有标记时也别留下空 span
-  const out = parts.join('');
-  return out || (spec.accentStyle === 'none' ? escapeHtml(text) : out);
-}
+export { escapeHtml, highlightHtml } from './card-text.js';
 
 /**
  * 卡片文案的统一入口：清 emoji、去标记、转义。
@@ -160,8 +153,8 @@ function esc(v: unknown): string {
   return escapeHtml(stripEmoji(String(v ?? '')));
 }
 
-/** 带强调标记的文案。 */
-function rich(v: unknown): string {
+/** 默认规格下的强调标记文案（历史上给过 diagnostics 用，保留导出）。 */
+export function rich(v: unknown): string {
   return highlightHtml(stripEmoji(String(v ?? '')), DEFAULT_RESOLVED);
 }
 
@@ -228,6 +221,25 @@ function baseCss(spec: ResolvedSpec, opts: { photoDataUri?: string } = {}): stri
   const dark = isDark(p.bg);
   const bg = opts.photoDataUri ? p.deep : p.bg;
 
+  // 账号模板带蒸馏出的强调色时，覆盖契约色板 —— 原账号的亮蓝 #007CFE
+  // 之前被 palette_index 的固定色板顶掉，验收要求 toResolved().palette.accent
+  // 能拿到蒸馏色。CSS 变量只在这里定义一次，改这里全卡生效。
+  // 空字符串 = 无账号强调色证据 → 严格回落主题色板，不再有默认蓝污染。
+  const accent = spec.accountTemplate.accent || p.accent;
+  // 有账号模板 = 复刻模式：**禁用通用渐变背景**。原账号内页是平涂
+  // #FAFAFA、封面纯白 —— signal-proof 主题的 #EAF3FF 渐变会把 rgba
+  // 编号等前景色整体染浅（实测编号从 #D6EAFF 变 #F0F7FF），也让底色
+  // 偏离原图。渐变只属于通用主题的"设计感"，复刻模式没有它。
+  const templateActive = !!(spec.accountTemplate.cover_header_text || spec.accountTemplate.inner_footer_text);
+  // 内页有页脚条时，老的 .footer（署名/水印行）必须让开**整条高度**再加间距，
+  // 否则压在条上。之前只加了 paddingY 的 62%（约 47-70px），dense 档下
+  // 内容区仍与条顶重叠 50px —— 修复为条高优先。
+  const hasFooterBar = !!(spec.accountTemplate.inner_footer_text);
+  const footerH = spec.accountTemplate.footer_bar_height ?? FOOTER_BAR_HEIGHT;
+  const footerBottom = hasFooterBar
+    ? footerH + 28
+    : Math.round(d.paddingY * 0.62);
+
   return `
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
     html,body{width:${CARD_WIDTH}px;height:${CARD_HEIGHT}px;overflow:hidden}
@@ -236,9 +248,9 @@ function baseCss(spec: ResolvedSpec, opts: { photoDataUri?: string } = {}): stri
       --bg:${bg};
       --ink:${opts.photoDataUri ? '#FFFFFF' : p.ink};
       --ink-soft:${opts.photoDataUri ? 'rgba(255,255,255,.82)' : p.inkSoft};
-      --accent:${p.accent};
-      --accent-soft:${hexAlpha(p.accent, dark ? 0.22 : 0.13)};
-      --on-accent:${isDark(p.accent) ? '#FFFFFF' : p.deep};
+      --accent:${accent};
+      --accent-soft:${hexAlpha(accent, dark ? 0.22 : 0.13)};
+      --on-accent:${isDark(accent) ? '#FFFFFF' : p.deep};
       --tint:${p.tint};
       --deep:${p.deep};
       --panel:${dark ? hexAlpha('#FFFFFF', 0.06) : hexAlpha(p.deep, 0.045)};
@@ -255,7 +267,7 @@ function baseCss(spec: ResolvedSpec, opts: { photoDataUri?: string } = {}): stri
       text-rendering:optimizeLegibility;
       color:var(--ink);
       background-color:var(--bg);
-      background-image:${opts.photoDataUri ? 'none' : backgroundCss({ bg: p.bg, palette: p, dark })};
+      background-image:${opts.photoDataUri || templateActive ? 'none' : backgroundCss({ bg: p.bg, palette: p, dark })};
     }
 
     .card{
@@ -300,7 +312,7 @@ function baseCss(spec: ResolvedSpec, opts: { photoDataUri?: string } = {}): stri
     .rule-fade{height:1px;background:linear-gradient(90deg,var(--accent) 0%,${hexAlpha(p.accent, 0.28)} 36%,transparent 100%)}
 
     .footer{
-      position:absolute;left:${d.paddingX}px;right:${d.paddingX}px;bottom:${Math.round(d.paddingY * 0.62)}px;
+      position:absolute;left:${d.paddingX}px;right:${d.paddingX}px;bottom:${footerBottom}px;
       display:flex;justify-content:space-between;align-items:flex-end;
       font-size:${t.caption}px;line-height:1.4;
       color:var(--ink-soft);opacity:.72;z-index:4;
@@ -334,6 +346,157 @@ function hexAlpha(hex: string, alpha: number): string {
 /* HTML 组装                                                           */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 品牌 logo 资产缓存：进程内读一次，buildCardHtml（同步）直接取 data URI。
+ *
+ * 为什么不走 HTTP：渲染用 page.setContent（无 base URL），相对路径解析不了；
+ * file:// 又要绕 notAllowedReload。资产总共几 KB，内存缓存最省事。
+ * 找不到文件时回落文字 logo，渲染不该因资产缺失而失败。
+ */
+const brandAssetCache = new Map<string, string | null>();
+
+function brandAssetDataUri(relPath: string): string | null {
+  if (brandAssetCache.has(relPath)) return brandAssetCache.get(relPath)!;
+  let uri: string | null = null;
+  try {
+    // relPath 形如 assets/brand/wow-logo-ink.png（coerceAccountTemplate 已校验格式）。
+    // 从本文件位置反推仓库根：编译后是 dist/generate/cards.js，向上三级是仓库根。
+    // 不能用 process.cwd()：服务可能从仓库根或 server/ 两种目录启动。
+    // file: URL 必须经 fileURLToPath —— Windows 下 pathname 是 /D:/...，直接
+    // path.resolve 会得到 D:\D:\...（实测踩过）。
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const repoRoot = path.resolve(here, '..', '..', '..');
+    const abs = path.join(repoRoot, 'server', relPath);
+    const buf = fsSync.readFileSync(abs);
+    uri = `data:image/png;base64,${buf.toString('base64')}`;
+  } catch {
+    uri = null;
+  }
+  brandAssetCache.set(relPath, uri);
+  return uri;
+}
+
+/**
+ * 账号 chrome：logo + 右对齐两行（主行 + 小字行）。
+ *
+ * 结构逐像素对照原账号（339/0.jpg 页眉、339/1.jpg 页脚，实测）：
+ *   - 左：图形 logo 资产（有 logo_asset_* 时）或文字 logo；bbox 原图
+ *     x≈63..239、y≈63..117 → 显示尺寸约 176×54，垂直居中于条内
+ *   - 右：主行 + 第二行小字，两行右对齐，文字块 bbox x≈550..1005
+ *   - 条高：模板实测值优先（原账号页眉 128 / 页脚 127），否则常量兜底
+ * 封面只出页眉条，内页只出页脚条 —— 与原账号一致。
+ *
+ * 返回 { html, barHeight }：布局层要按同一高度扣除安全区，不能各算各的。
+ */
+function accountChrome(
+  template: AccountTemplate,
+  cover: boolean,
+): { html: string; barHeight: number } {
+  const headerH = template.header_bar_height ?? HEADER_BAR_HEIGHT;
+  const footerH = template.footer_bar_height ?? FOOTER_BAR_HEIGHT;
+  const barHeight = cover ? headerH : footerH;
+
+  const main = cover ? template.cover_header_text : template.inner_footer_text;
+  const sub = cover ? template.cover_header_sub : template.inner_footer_sub;
+  const bg = cover ? template.cover_header_bg : template.inner_footer_bg;
+  const ink = cover ? template.cover_header_ink : template.inner_footer_ink;
+  const logo = template.cover_logo_text;
+
+  if (!main && !sub && !logo) return { html: '', barHeight };
+
+  const pos = cover ? 'top:0;left:0;right:0' : 'bottom:0;left:0;right:0';
+
+  // 图形 logo：透明底 PNG，按原 bbox 标称尺寸等比放。深色条用浅色版。
+  // 资产读不到（或路径非法）时回落文字 logo —— 渲染不因资产缺失而失败，
+  // 但验收脚本会区分 logo_asset / logo_textual 两种保真等级。
+  const dark = isDark(bg);
+  const asset = dark ? template.logo_asset_light : template.logo_asset_dark;
+  const safeAsset = asset && /^assets\/[\w\-./]+\.png$/.test(asset) ? asset : null;
+  const dataUri = safeAsset ? brandAssetDataUri(safeAsset) : null;
+  const logoHtml = dataUri
+    ? `<img src="${dataUri}" alt="${esc(logo)}" data-smoke-logo
+         style="height:54px;width:auto;display:block" />`
+    : logo
+      ? `<span style="font-size:44px;font-weight:800;letter-spacing:.02em;line-height:1">${esc(logo)}</span>`
+      : '<span></span>';
+
+  return {
+    barHeight,
+    html: `<div style="position:absolute;${pos};height:${barHeight}px;z-index:6;display:flex;align-items:center;justify-content:space-between;padding:0 66px;background:${bg};color:${ink}">
+      ${logoHtml}
+      <span style="display:flex;flex-direction:column;align-items:flex-end;text-align:right">
+        ${main ? `<span style="font-size:28px;font-weight:800;letter-spacing:.02em;line-height:1.25">${esc(main)}</span>` : ''}
+        ${sub ? `<span style="font-size:16px;font-weight:500;letter-spacing:.02em;line-height:1.4;opacity:.85;margin-top:4px">${esc(sub)}</span>` : ''}
+      </span>
+    </div>`,
+  };
+}
+
+/**
+ * 内页编号：**按模板族**渲染两种真实形态。
+ *
+ * wow-ip-trend-v1（339/1 实测）：大号浅蓝纯数字
+ *   bbox 69..198 × 161..346，字面高约 88px，色 #D9E9FB
+ *
+ * wow-brand-case-v1（340/1 实测）：细字「前缀 · 数字」
+ *   bbox 98..393 × 131..151，字面高约 20px，纯强调色 #007CFE、字间距拉开
+ *   横向细线紧跟其后（原图是一条 1px 浅灰线通栏）
+ *
+ * 形态是**族特征**：把 340 画成大号浅蓝、或把 339 画成细字，都是原账号
+ * 从未出现过的版式。numbering='none' 的族不画编号。
+ *
+ * ⚠️ 定位语义实测澄清：absolute 的包含块是 .card 的 **padding box**，
+ * 原点 = border 内沿 = 画布原点（padding 不参与偏移）——
+ * 之前按"从 padding 之后算"推成 top:10/left:-3，编号画到了画布左上角
+ * 外沿（Playwright getBoundingClientRect 实证）。所以直接写画布坐标。
+ */
+function accountPageNumber(
+  spec: ResolvedSpec,
+  pageNo: string,
+  isCover: boolean,
+): string {
+  if (isCover || !pageNo) return '';
+  const t = spec.accountTemplate;
+  if (t.numbering === 'none') return '';
+  const style = FAMILY_NUMBERING[t.family ?? 'generic-enum-v1'];
+
+  // blue-tag：顶部蓝底反白标签 + 白字（357/2 实测 bbox 99..324 × 99..166，
+  // 约 226×68px）。标签本身即章节标记，不再叠加页码。
+  if (style === 'blue-tag') {
+    const prefix = t.numbering_prefix ?? '';
+    const label = prefix ? `${prefix} ${pageNo}` : pageNo;
+    return `<div aria-hidden="true" data-smoke-page-no style="position:absolute;
+      top:99px;left:99px;display:inline-flex;align-items:center;justify-content:center;
+      padding:0 26px;height:68px;
+      background:var(--accent);color:var(--on-accent);
+      font-size:30px;font-weight:800;line-height:1;
+      z-index:5">${escapeHtml(label)}</div>`;
+  }
+
+  if (style === 'label-accent' || style === 'label-dark') {
+    // 细字「PREFIX · NN」。brand-case 带后接通栏横线且用强调色；
+    // label-dark 是正文深灰、无横线（351/366/372 实测）。
+    const prefix = t.numbering_prefix ?? '';
+    const label = prefix ? `${prefix} · ${pageNo}` : pageNo;
+    const isAccent = style === 'label-accent';
+    return `<div aria-hidden="true" data-smoke-page-no style="position:absolute;
+      top:${isAccent ? 131 : 140}px;left:${isAccent ? 98 : 98}px;
+      display:flex;align-items:center;gap:28px;width:calc(100% - 196px);
+      font-size:20px;font-weight:700;letter-spacing:0.34em;text-transform:uppercase;
+      line-height:1;color:${isAccent ? 'var(--accent)' : 'var(--ink)'};z-index:5">
+      <span style="flex:0 0 auto;font-variant-numeric:tabular-nums">${escapeHtml(label)}</span>
+      ${isAccent ? '<span style="flex:1;height:1px;background:var(--hairline)"></span>' : ''}
+    </div>`;
+  }
+
+  // big-number（大号浅蓝纯数字）
+  return `<div aria-hidden="true" data-smoke-page-no style="position:absolute;
+    top:161px;left:69px;
+    font-variant-numeric:tabular-nums;font-size:88px;font-weight:800;
+    line-height:1;letter-spacing:0.01em;
+    color:rgba(0,124,254,0.16);z-index:5">${escapeHtml(pageNo)}</div>`;
+}
+
 export function buildCardHtml(
   card: Card,
   spec: ResolvedSpec,
@@ -342,27 +505,36 @@ export function buildCardHtml(
   const dark = isDark(spec.palette.bg);
   const b = card.blocks;
 
+  // 编号语义与原账号一致（339/0=无编号、339/1=01、339/2=02，实测）：
+  // 封面不占号，第一张内页（index=1）是 01。模型给的 watermark 仍优先。
+  const modelWatermark = typeof b.watermark === 'string' ? b.watermark.trim() : '';
+  const idx = card.index ?? 0;
+  const pageNo = modelWatermark || (card.layout === 'cover' ? '' : badgeText(Math.max(0, idx - 1)));
+
   const motifCtx: MotifContext = {
     palette: spec.palette,
     dark,
     fontMono: `ui-monospace, Consolas, "Cascadia Mono", monospace`,
     fontBody: spec.fontBody,
-    pageNo: typeof b.watermark === 'string' ? b.watermark : undefined,
+    pageNo,
     tag: typeof b.eyebrow === 'string' ? b.eyebrow : undefined,
   };
 
-  const pageNo = typeof b.watermark === 'string' ? b.watermark : badgeText(0);
-
   // 三层：纹理 → 装饰 → 内容。装饰与纹理都绝对定位、不吃布局，
   // 所以内容层可以自由改版式而不用管它们。
-  const texture = textureLayer({
-    texture: spec.texture,
-    bg: spec.palette.bg,
-    accent: spec.palette.accent,
-    tint: spec.palette.tint,
-    dark,
-    zIndex: 1,
-  });
+  // 复刻模式（有账号模板）关闭纹理与通用装饰：原账号内页没有噪点/网格，
+  // 半透明纹理层会扰动像素验收（页脚条中位色、编号混色都被它移动）。
+  const templateActive = !!(spec.accountTemplate.cover_header_text || spec.accountTemplate.inner_footer_text);
+  const texture = templateActive
+    ? ''
+    : textureLayer({
+        texture: spec.texture,
+        bg: spec.palette.bg,
+        accent: spec.palette.accent,
+        tint: spec.palette.tint,
+        dark,
+        zIndex: 1,
+      });
 
   const content = layoutBody(card.layout, {
     blocks: b,
@@ -375,12 +547,40 @@ export function buildCardHtml(
   // 图卡自己铺底图，纹理层要压在底图之上、内容之下
   const isPhoto = card.layout === 'photo_text' && Boolean(photoDataUri);
 
+  const template = spec.accountTemplate.cover_header_text || spec.accountTemplate.inner_footer_text
+    ? spec.accountTemplate
+    : (spec.contract.account_template ?? DEFAULT_ACCOUNT_TEMPLATE);
+  // 有封面页眉条时，内容整体下移让出**整条高度**——之前 dense 档 paddingY=76
+  // 小于条高 128，标题/装饰会顶进页眉条里；现在条高优先再加 24px 呼吸。
+  // 内页同理让出页脚条：内容可用高度 = 画布 - 条高，而不是让绝对定位的
+  // 条盖在内容上装作看不见。
+  const chrome = accountChrome(template, card.layout === 'cover');
+  const coverBarH = template.cover_header_text ? chrome.barHeight : 0;
+  const footerBarH = !isCoverPage(card.layout) && template.inner_footer_text ? template.footer_bar_height ?? FOOTER_BAR_HEIGHT : 0;
+  const topPad = coverBarH > 0
+    ? Math.max(spec.density.paddingY, coverBarH + 24)
+    : spec.density.paddingY;
+  const chromeCss = `<style>.card{
+    padding-top:${topPad}px !important;
+    ${footerBarH > 0 ? `padding-bottom:${footerBarH + 28}px !important;` : ''}
+  }
+  /* 内容层的坐标原点 = .card 的 padding box 内沿 = 画布原点 + 顶部 padding。
+     复刻版式要按**画布坐标**落位（标题 y=266 是原图实测），所以把
+     注入的顶部 padding 暴露成变量，布局层用 calc 抵扣，不靠硬编码密度值。 */
+  :root{--pad-top:${topPad}px;--pad-x:${spec.density.paddingX}px}
+  </style>`;
+
+  // 编号在 chrome 层画（画布坐标，见 accountPageNumber 注释）
+  const pageNoHtml = accountPageNumber(spec, pageNo, isCoverPage(card.layout));
+
   return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><style>${baseCss(spec, { photoDataUri: isPhoto ? photoDataUri : undefined })}</style></head>
+<html lang="zh-CN"><head><meta charset="utf-8">${chromeCss}<style>${baseCss(spec, { photoDataUri: isPhoto ? photoDataUri : undefined })}</style></head>
 <body><div class="card">
   ${texture}
   ${motifLayer(spec.motifs, motifCtx, motifZone(card.layout))}
   <div style="position:relative;z-index:2;height:100%">${content}</div>
+  ${pageNoHtml}
+  ${chrome.html}
   ${
     // 图卡的页脚会压在图上看不清，交给 cta / 内容层自己处理
     isPhoto
@@ -388,6 +588,11 @@ export function buildCardHtml(
       : `<div class="footer"><span>${esc(b.brand ?? '')}</span><span>${esc(b.watermark ?? '')}</span></div>`
   }
 </div></body></html>`;
+}
+
+/** 封面判定：cover 版式是封面；photo_text/cta 也可能作为收尾内页。 */
+function isCoverPage(layout: string): boolean {
+  return layout === 'cover';
 }
 
 /* ------------------------------------------------------------------ */
