@@ -31,9 +31,12 @@ let openaiKey = '';
  * 超时要报**可识别**的错误文案，走既有重试路径，不当成不可重试。
  */
 function timeoutForMs(maxTokens: number, hasImages: boolean): number {
-  if (hasImages) return 300_000;
-  // 经验值：MiniMax-M3.1 每 1k 输出 token 约 8~10s（推理模型还要 thinking）
-  return Math.max(180_000, Math.min(420_000, maxTokens * 12));
+  if (hasImages) return 420_000;
+  // 经验值：MiniMax-M3.1 每 1k 输出 token 约 8~12s，且是推理模型还要先 thinking。
+  // 实测创作一篇（max_tokens=16384，7 张卡、2500+ 字）耗时 90~200s 且波动大 ——
+  // 最初按 12ms/token 算出的 197s 刚好卡在真实耗时边缘，直接把正常创作判成超时
+  // （2026-10-19 实测踩到）。下限抬到 240s、上限到 900s。
+  return Math.max(240_000, Math.min(900_000, maxTokens * 50));
 }
 
 function getOpenAI(baseURL: string, apiKey: string, timeoutMs: number): OpenAI {

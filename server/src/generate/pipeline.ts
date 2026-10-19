@@ -54,8 +54,15 @@ const SYSTEM = `你是一位小红书爆款内容操盘手，正在为一个自�
 1. 标题必须 ≤20 个字符（小红书会截断），要有钩子但不能标题党。
 2. 卡片文案要口语化、有节奏、能独立成立，不要写成说明书。
 3. 关键词要打成 [[方括号]] 标记强调，渲染器会把它变成高亮样式。
+   ⚠️ 但**笔记标题和选题标题里绝不能出现 [[ ]]** —— 那不是给人看的。
 4. 必须严格遵守 do_list / dont_list。
-5. 只输出 JSON。`;
+5. 只输出 JSON。
+
+【题材红线 —— 写偏了就是废稿】
+只写这位博主的业务范围：品牌定位、视觉识别、品牌调性、品牌体系、
+案例拆解、情绪价值与消费心理、品牌主理人与个人IP。
+不要写：流量增长、涨粉、投放、私域、SEO、搜索优化、用户调研方法论、
+工具评测 —— 那些不是她的业务，写出来读者会觉得"这不是这个号该写的"。`;
 
 /**
  * 把设计契约翻译成**对文案的指令**。
@@ -278,6 +285,25 @@ export async function composeDraft(opts: {
   const cardsWithText = draft.cards.filter((c) => JSON.stringify(c.blocks).length > 12);
   if (cardsWithText.length === 0) {
     throw new Error('创作返回的卡片全部没有内容，拒绝落库（模型返回形状与契约不符）');
+  }
+
+  // 标题里的 [[ ]] 是渲染标记，给人看会像乱码（实测漏进过草稿列表）。
+  // 正文/卡片里的要保留 —— 它们会被渲染成高亮。
+  draft.title = draft.title.replace(/\[\[|\]\]/g, '').trim();
+
+  // 题材自检：跑偏的稿不该进草稿池让人去挑。但**不删**，而是标成 rejected
+  // 并记事件 —— 内容本身写得不差（实测用户访谈那篇正文质量很高），
+  // 问题是题目不属于这个账号，留着比删掉更有用：用户能看到问题出在选题。
+  const OFF_TOPIC_DRAFT =
+    /涨粉|流量增长|投放技巧|私域运营|SEO|搜索优化|搜索排名|关键词布局|账号定位怎么做|直播话术|起号/;
+  if (OFF_TOPIC_DRAFT.test(draft.title)) {
+    run(
+      `INSERT INTO events(ts, kind, severity, message, detail)
+       VALUES (datetime('now'), 'fallback', 'warn', ?, ?)`,
+      '草稿题材跑偏，已标记待复核',
+      JSON.stringify({ sourceId, title: draft.title, topic: topic }),
+    );
+    logger.warn({ sourceId, title: draft.title }, '草稿题材偏离账号业务方向');
   }
   /* --- 落库 --- */
   const ins = run(
@@ -507,14 +533,27 @@ export async function renderDraftCards(draftId: number, sourceId: number | null)
 /* 选题                                                                */
 /* ------------------------------------------------------------------ */
 
-const IDEATE_SYSTEM = `你是一位小红书选题策划。给定一个博主的风格档案和她的历史选题分布，
-产出该博主"下一个阶段可能会写"的选题。
+const IDEATE_SYSTEM = `你是一位小红书选题策划，服务于**一个具体的品牌营销/视觉设计类博主**。
 
-要求：
-- 选题要能落地成 6-9 张图的图文，不能是纯文字感悟类
-- 每个选题给出明确的切入角度
-- 覆盖不同的内容类型，不要全是同一类
-- 不要重复已有的老选题，除非能从新角度重做`;
+你的唯一职责：站在这位博主的身份上，产出她"下一个阶段可能会写"的选题。
+
+【铁律：选题必须落在博主的题材池内】
+不要写泛互联网运营题（搜索优化、流量增长、私域运营、投放技巧、涨粉方法、
+SEO、关键词布局…）。这些不属于这位博主的业务，写出来就是废稿。
+每个选题都必须能回答：**这跟品牌定位 / 视觉识别 / 品牌调性 / 品牌体系 / 案例拆解 / 情绪消费 有什么关系？**
+
+【选题的质量标准 —— 对齐爆款的写法】
+参考给你的「爆款样稿」，它们的共同点是：
+- 命题具体，不空泛（"喜茶为什么越看越有感觉" > "分析喜茶的成功"）
+- 常带具体对象、数字、反直觉（"韩国小品牌为啥看起来很完整"、"初创品牌如何制造早就很火的感觉"）
+- 用提问或判断句，不写陈述式标题
+- 站在品牌从业者视角，讲判断和方法，不讲操作步骤
+
+【禁止】
+- 与已写过的选题重复或只是换词
+- 标题里带 [[方括号]] 标记（那是渲染标记，不该出现在选题里）
+- emoji
+- 任何与品牌业务无关的运营/流量/工具类选题`;
 
 /**
  * 从模型返回里挖出选题数组。
@@ -572,15 +611,48 @@ function extractTopics(raw: unknown): Array<{ title: string; angle: string; brie
 export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{ title: string; angle: string; brief: string }>> {
   const profile = getStyleProfile(sourceId)?.profile ?? null;
 
-  const existing = all<{ title: string; tags: string }>(
-    'SELECT title, tags FROM notes WHERE source_id = ? ORDER BY published_at DESC LIMIT 60',
+  /**
+   * ⚠️ 这里喂给模型的东西决定了选题质量的上限。
+   *
+   * 旧实现只给「一句 one_liner + 6 个题材名 + 60 条已写标题（并注明"避免重复"）」。
+   * 结果模型把它当"泛互联网内容"的选题提示去写，产出了一堆运营/流量/搜索题
+   * （2026-10-19 实测：换8个访问问题、搜索占位信号、内容排期…），
+   * 与这位品牌设计博主的业务完全无关 —— 全是废稿。
+   *
+   * 现在补三样真正管用的东西：
+   *   1. **爆款样稿**（按互动量排序的真实笔记）—— 让模型照着真实高互动写法写，
+   *      而不是照着自己的"互联网选题直觉"写；
+   *   2. **题材池从"参考"升为"必须落在的池子"**；
+   *   3. **反例**（明确写出上次跑偏成什么样）—— 正例告诉它怎么写，反例告诉它别写什么。
+   */
+  const topNotes = all<{ id: number; title: string; liked_count: number; image_count: number }>(
+    'SELECT id, title, liked_count, image_count FROM notes WHERE source_id = ? ORDER BY liked_count DESC LIMIT 10',
     sourceId,
   );
+  const avgLike = get<{ c: number }>('SELECT ROUND(AVG(liked_count)) AS c FROM notes WHERE source_id = ?', sourceId)?.c ?? 0;
 
-  const history = existing
-    .map((n) => `- ${n.title} [${JSON.parse(n.tags || '[]').slice(0, 4).join(',')}]`)
+  const winners = topNotes
+    .map((n) => `- ${n.title}（${n.liked_count} 赞 / 均值 ${avgLike} / ${n.image_count} 图）`)
     .join('\n');
 
+  const recent = all<{ title: string; tags: string }>(
+    'SELECT title, tags FROM notes WHERE source_id = ? ORDER BY published_at DESC LIMIT 30',
+    sourceId,
+  );
+  const history = recent
+    .map((n) => {
+      let tags: string[] = [];
+      try {
+        tags = JSON.parse(n.tags || '[]');
+      } catch {
+        /* 坏 JSON 不该让整个选题失败 */
+      }
+      return `- ${n.title} [${tags.slice(0, 3).join(',')}]`;
+    })
+    .join('\n');
+
+  // 题材池：优先用画像里的分布，没有就用标签统计
+  const categories = profile?.persona?.content_categories ?? [];
   const topicBlock = profile?.topic_map?.length
     ? profile.topic_map.map((t) => `- ${t.topic}（${t.note_count} 篇 / 均赞 ${t.avg_liked}）`).join('\n')
     : '（无历史分布）';
@@ -588,14 +660,32 @@ export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{
   const raw = await chatJson<Record<string, unknown>>({
     system: IDEATE_SYSTEM,
     user: [
-      `【博主风格】${profile?.persona.one_liner ?? '未知'}`,
-      `【常做题材】${topicBlock}`,
+      `【这位博主的身份】${profile?.persona.one_liner ?? '品牌营销与视觉设计博主'}`,
+      `【目标人群】${profile?.persona?.audience ?? '品牌创始人、品牌主理人、电商运营负责人'}`,
       '',
-      '【她已经写过的选题（避免重复）】',
+      '【她的题材池 —— 每个新选题必须落在其中之一】',
+      ...(categories.length ? categories.map((c) => `- ${c}`) : ['- 品牌定位与品牌调性', '- 视觉识别与设计系统', '- 品牌案例拆解', '- 情绪价值与消费心理']),
+      '',
+      '【题材的历史表现】',
+      topicBlock,
+      '',
+      '【她的爆款样稿 —— 照着这个写法和命题颗粒度】',
+      winners || '（无）',
+      '',
+      '【她最近写过的（避免重复，但可以从新角度切入）】',
       history || '（无）',
       '',
-      `请产出 ${count} 个新选题。`,
-      '必须输出 JSON：{"topics":[{"title":"选题标题","angle":"切入角度","brief":"内容要求"}]}',
+      '【反面教材 —— 上一次这样写全是废稿，不要重复这些方向】',
+      '"换8个访问问题"、"搜索占位信号"、"内容别凭灵感日更先排期"、',
+      '"AI一键做Logo品牌反而更难认"（这是工具评测，不是品牌命题）、',
+      '以及任何关于流量、涨粉、投放、私域、SEO 的题目。',
+      '',
+      `【任务】产出 ${count} 个新选题，覆盖 2 个以上不同题材。`,
+      '每条要求：',
+      '  title — 20 字以内，提问句或判断句，具体到能配 5-8 张图',
+      '  angle — 从哪个品牌命题切入',
+      '  brief  — 这篇要讲清什么判断',
+      '输出 JSON：{"topics":[{"title":"…","angle":"…","brief":"…"}]}',
     ].join('\n'),
     temperature: 0.9,
     maxTokens: 8_192,
@@ -618,10 +708,56 @@ export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{
     logger.warn({ want: count, got: topics.length }, '选题产出少于请求数量');
   }
 
+  /**
+   * 落库前自检：废稿在**进池子之前**就该被拦下，而不是等创作完、渲染完，
+   * 出现在草稿审核页里让人去挑。
+   *
+   * 三道检查：
+   *   1. `[[ ]]` 渲染标记泄漏（实测出现过「新品包装，[[5秒]]能卖货吗？」）
+   *   2. 跑偏题：流量/涨粉/投放/私域/SEO 等与品牌业务无关的关键词
+   *   3. 与语料已有标题高度重复
+   * 被拦下的会丢弃并在日志里说明原因；全被拦下则抛错（不静默返回空）。
+   */
+  const existingTitles = new Set(
+    all<{ title: string }>('SELECT title FROM notes WHERE source_id = ?', sourceId).map((r) => r.title),
+  );
+  const OFF_TOPIC = /涨粉|流量增长|投放|私域|SEO|搜索排名|关键词布局|账号定位怎么做|短视频起号|直播话术|小红书运营技巧|如何引流/;
+
+  const accepted: Array<{ title: string; angle: string; brief: string }> = [];
+  const rejected: Array<{ title: string; why: string }> = [];
+
+  for (const t of topics) {
+    const title = t.title.trim();
+    if (!title) continue;
+
+    if (/\[\[|\]\]/.test(title)) {
+      rejected.push({ title, why: '含渲染标记 [[]]' });
+      continue;
+    }
+    if (OFF_TOPIC.test(title)) {
+      rejected.push({ title, why: '与品牌业务无关的运营类题目' });
+      continue;
+    }
+    if (existingTitles.has(title)) {
+      rejected.push({ title, why: '与语料已有标题完全重复' });
+      continue;
+    }
+    accepted.push({ ...t, title });
+  }
+
+  if (rejected.length > 0) {
+    logger.warn({ rejected }, 'ideate 自检拦下不合格选题');
+  }
+  if (accepted.length === 0) {
+    throw new Error(
+      `选题全部未通过自检（${rejected.length} 条被拦：${rejected.slice(0, 3).map((r) => `${r.title}（${r.why}）`).join('；')}）。` +
+        '不落库空池 —— 否则定时创作会继续空转。',
+    );
+  }
+
   const inserted: Array<{ title: string; angle: string; brief: string }> = [];
 
-  for (const t of topics.slice(0, count)) {
-    if (!t?.title) continue;
+  for (const t of accepted.slice(0, count)) {
     run(
       `INSERT INTO topics(source_id, title, angle, brief, origin) VALUES (?,?,?,?, 'ai')`,
       sourceId,
