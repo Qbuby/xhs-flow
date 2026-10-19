@@ -219,7 +219,13 @@ function baseCss(spec: ResolvedSpec, opts: { photoDataUri?: string } = {}): stri
   const t = spec.type;
   const d = spec.density;
   const dark = isDark(p.bg);
-  const bg = opts.photoDataUri ? p.deep : p.bg;
+  // 有账号模板 = 复刻模式：**底色不因配图而变深**。
+  // `photoDataUri ? p.deep : p.bg` 是给通用满铺图卡设计的（整页铺图 + 压字）。
+  // 复刻模式里配图是页面里的一个**局部元素**（原账号 340/0 的图就在白底页面上），
+  // 底色必须保持白/浅灰 —— 否则整页变深蓝黑，与原账号完全不符
+  // （实测 2026-10-19：photo_text 渲染成满铺暗底）。
+  const familyMode = !!(spec.accountTemplate.cover_header_text || spec.accountTemplate.inner_footer_text);
+  const bg = opts.photoDataUri && !familyMode ? p.deep : p.bg;
 
   // 账号模板带蒸馏出的强调色时，覆盖契约色板 —— 原账号的亮蓝 #007CFE
   // 之前被 palette_index 的固定色板顶掉，验收要求 toResolved().palette.accent
@@ -246,8 +252,9 @@ function baseCss(spec: ResolvedSpec, opts: { photoDataUri?: string } = {}): stri
 
     :root{
       --bg:${bg};
-      --ink:${opts.photoDataUri ? '#FFFFFF' : p.ink};
-      --ink-soft:${opts.photoDataUri ? 'rgba(255,255,255,.82)' : p.inkSoft};
+      /* 复刻模式下配图只是页面里的一个元素，不能把整页文字翻成白色 */
+      --ink:${opts.photoDataUri && !familyMode ? '#FFFFFF' : p.ink};
+      --ink-soft:${opts.photoDataUri && !familyMode ? 'rgba(255,255,255,.82)' : p.inkSoft};
       --accent:${accent};
       --accent-soft:${hexAlpha(accent, dark ? 0.22 : 0.13)};
       --on-accent:${isDark(accent) ? '#FFFFFF' : p.deep};
@@ -259,6 +266,8 @@ function baseCss(spec: ResolvedSpec, opts: { photoDataUri?: string } = {}): stri
       --font-title:${spec.fontTitle};
       --font-body:${spec.fontBody};
       --scrim:${photoScrim(dark ? 0.82 : 0.74)};
+      /* 复刻模式不需要压字蒙版 */
+      --photo-overlay:${opts.photoDataUri && !familyMode ? 'var(--scrim)' : 'none'};
     }
 
     body{
@@ -295,6 +304,11 @@ function baseCss(spec: ResolvedSpec, opts: { photoDataUri?: string } = {}): stri
       font-weight:400;
       font-style:normal; /* 中文禁用斜体 */
     }
+    /* 反白容器里的正文必须继承容器颜色。
+       ⚠️ .t-body 自带 color:var(--ink-soft)，会**覆盖**父容器的白字 ——
+       蓝底上的字于是变成深灰，几乎看不清（实测 2026-10-19）。
+       .on-accent 显式声明「在强调色底上」，把颜色交回容器继承。 */
+    .on-accent{color:inherit}
 
     .t-meta{
       font-size:${t.meta}px;

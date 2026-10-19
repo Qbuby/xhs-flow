@@ -146,6 +146,46 @@ for (const card of cardsB) {
   shotsB.push({ layout: card.layout, index: card.index, html, file });
 }
 
+/** 组件保真样本：compare（深蓝黑块）与 cta（无胶囊按钮）。 */
+const shotsC: Array<Shot & { renderedHtml?: string }> = [];
+{
+  const compareSpec = toResolved({
+    ...(found.profile.card_template_spec as Record<string, unknown>),
+    account_template: {
+      ...BRAND,
+      family: 'wow-brand-case-v1',
+      header_bar_height: 128,
+      footer_bar_height: 128,
+      numbering: '01',
+      numbering_prefix: 'SHIFT',
+      columns: 2,
+    },
+  });
+  const ctaSpec = toResolved({
+    ...(found.profile.card_template_spec as Record<string, unknown>),
+    account_template: { ...BRAND, family: 'wow-ip-trend-v1', header_bar_height: 128, footer_bar_height: 127, numbering: '01', columns: 2 },
+  });
+  const compareHtml = buildCardHtml(
+    {
+      layout: 'compare',
+      index: 1,
+      blocks: {
+        title: '色卡和完整系统，差的是使用规则',
+        left: { title: '静态色卡', items: ['锁定品牌主色', '标注Logo与包装色'] },
+        right: { title: '动态色卡', items: ['给每种颜色分配角色', '建立正文与背景层级'] },
+        conclusion: '色卡管「是什么」，系统管「怎么用」',
+      },
+    },
+    compareSpec,
+  );
+  const ctaHtml = buildCardHtml(
+    { layout: 'cta', index: 2, blocks: { title: '品牌升级前，先查5层规则', action: '做视觉升级、内容营销？[[可以聊聊。]]' } },
+    ctaSpec,
+  );
+  shotsC.push({ layout: 'compare', index: 1, html: compareHtml, file: path.join(outDir, 'golden-compare.jpg') });
+  shotsC.push({ layout: 'cta', index: 2, html: ctaHtml, file: path.join(outDir, 'golden-cta.jpg') });
+}
+
 // A1：封面无编号 DOM
 const coverHtml = shots[0]!.html;
 if (/data-smoke-page-no/.test(coverHtml)) failures.push('A1 封面不应有 data-smoke-page-no 编号元素');
@@ -227,12 +267,78 @@ try {
     await page.waitForTimeout(150);
     await page.screenshot({ path: s.file, type: 'jpeg', quality: 95 });
   }
+
+  // 组件保真样本（compare / cta）—— 必须在浏览器关闭前渲染
+  for (const s of shotsC) {
+    await page.setContent(s.html, { waitUntil: 'load' });
+    await page.evaluate(() => (document as Document & { fonts?: { ready: Promise<void> } }).fonts?.ready);
+    await page.waitForTimeout(150);
+    await page.screenshot({ path: s.file, type: 'jpeg', quality: 95 });
+    s.renderedHtml = await page.content();
+  }
 } finally {
   await ctx.close().catch(() => undefined);
   await closeRenderer().catch(() => undefined);
 }
 
 /** 区域中位色。 */
+/**
+ * 区域里最暗的一块（40×40 窗口的最低中位亮度）的中位色。
+ * 用来在**不写死坐标**的前提下找到深色块 —— 写死坐标会随版式漂移。
+ */
+async function darkestRegion(
+  file: string,
+  r: { left: number; top: number; width: number; height: number },
+): Promise<number[] | null> {
+  try {
+    const { data, info } = await sharp(file)
+      .extract({ left: r.left, top: r.top, width: r.width, height: r.height })
+      .removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    let best: number[] | null = null;
+    let bestLum = 1e9;
+    for (let y = 0; y + 40 <= r.height; y += 20) {
+      for (let x = 0; x + 40 <= r.width; x += 20) {
+        const rs: number[] = [], gs: number[] = [], bs: number[] = [];
+        for (let yy = y; yy < y + 40; yy += 4) {
+          for (let xx = x; xx < x + 40; xx += 4) {
+            const i = (yy * info.width + xx) * info.channels;
+            rs.push(data[i]!); gs.push(data[i + 1]!); bs.push(data[i + 2]!);
+          }
+        }
+        const med = (a: number[]) => a.sort((p, q) => p - q)[Math.floor(a.length / 2)]!;
+        const px = [med(rs), med(gs), med(bs)];
+        const lum = (px[0]! * 0.2126 + px[1]! * 0.7152 + px[2]! * 0.0722) / 255;
+        if (lum < bestLum) { bestLum = lum; best = px; }
+      }
+    }
+    return best;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 区域中位色（逐通道）。用于「这块是不是深蓝黑 #0A172A」这类断言。
+ */
+async function regionMedian(
+  file: string,
+  r: { left: number; top: number; width: number; height: number },
+): Promise<number[] | null> {
+  try {
+    const { data, info } = await sharp(file)
+      .extract({ left: r.left, top: r.top, width: r.width, height: r.height })
+      .removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    const ch: number[][] = [[], [], []];
+    for (let i = 0; i < data.length; i += info.channels) {
+      ch[0]!.push(data[i]!); ch[1]!.push(data[i + 1]!); ch[2]!.push(data[i + 2]!);
+    }
+    const med = (a: number[]) => a.sort((x, y) => x - y)[Math.floor(a.length / 2)]!;
+    return [med(ch[0]!), med(ch[1]!), med(ch[2]!)];
+  } catch {
+    return null;
+  }
+}
+
 async function regionColor(file: string, r: { x: number; y: number; w: number; h: number }): Promise<number[]> {
   const { data, info } = await sharp(file)
     .extract({ left: r.x, top: r.y, width: r.w, height: r.h })
@@ -396,6 +502,70 @@ const innerFileB = shotsB[1]!.file;
   }
   if (ink < 200) failures.push(`B9 族二标题行（y266..319）墨迹不足（${ink}）—— 标题未落到实测行位`);
   notes.push(`B9 族二标题行墨迹=${ink}`);
+}
+
+/* --- C. 组件保真回归（2026-10-19 用户截图指出三处不符后加） --- */
+
+/**
+ * 组件级断言：拿原图实测值当预期，防止再次退化。
+ *
+ * 起因：用户对比生成图与语料原图，指出三处不符 ——
+ *   1. compare 右列是**深蓝黑 #0A172A** 实心块（340/2 实测 x614..982），
+ *      不是强调蓝；且框是**直角**，不是 18px 圆角；
+ *   2. 蓝底上的文字必须**白字** —— .t-body 自带 color:var(--ink-soft)
+ *      会覆盖继承色，实测渲染出深灰字几乎看不清；
+ *   3. cta 收尾**没有按钮** —— 原账号是加粗文字行 + 蓝色强调句，
+ *      胶囊按钮 + 箭头是通用主题的元素。
+ */
+const compareFile = path.join(outDir, 'golden-compare.jpg');
+const ctaFile = path.join(outDir, 'golden-cta.jpg');
+{
+  // C1：compare 右列必须是深蓝黑 #0A172A（不是强调蓝 #007CFE）
+  // ⚠️ 采样点不能写死：不同族/版式的块位置不同，写死会采到白底（踩过）。
+  // 改成「页面上半部右侧区域里，找亮度最低的那块 40x40 区域」——
+  // 深蓝黑块必然是那块，且它一定在右半边（对比结构）。
+  const darkBlock = await darkestRegion(compareFile, { left: 540, top: 420, width: 500, height: 700 });
+  if (darkBlock) {
+    const d = Math.max(
+      Math.abs(darkBlock[0]! - 0x0a),
+      Math.abs(darkBlock[1]! - 0x17),
+      Math.abs(darkBlock[2]! - 0x2a),
+    );
+    if (d > 14) failures.push(`C1 compare 右列块色 rgb(${darkBlock.join(',')}) 期望≈#0A172A（原图 340/2 实测）`);
+    notes.push(`C1 compare 右列块色 rgb(${darkBlock.join(',')})`);
+  }
+
+  // C2：深色块上的文字必须是白字（不能是深灰 —— .t-body 会覆盖继承色）
+  {
+    const { data: cd2, info: ci2 } = await sharp(compareFile).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    let white = 0;
+    let grey = 0;
+    for (let y = 480; y < 1020; y++) {
+      for (let x = 620; x < 980; x++) {
+        const i = (y * ci2.width + x) * ci2.channels;
+        const r = cd2[i]!, g = cd2[i + 1]!, b = cd2[i + 2]!;
+        if (r > 225 && g > 225 && b > 225) white++;
+        else if (r > 90 && r < 190 && Math.abs(r - g) < 14 && Math.abs(g - b) < 14) grey++;
+      }
+    }
+    if (white < 400) failures.push(`C2 compare 深色块上的白字太少（${white}）—— .t-body 覆盖了继承色`);
+    if (grey > white) failures.push(`C2 compare 深色块上是灰字（grey=${grey} > white=${white}）`);
+    notes.push(`C2 compare 深色块 white=${white} grey=${grey}`);
+  }
+
+  // C3：复刻模式**不允许圆角胶囊**。cta 页面里不该有 border-radius:999px
+  {
+    const html = shotsC.find((s) => s.layout === 'cta')?.renderedHtml ?? '';
+    if (/border-radius:999px/.test(html)) failures.push('C3 cta 出现了胶囊按钮（原账号没有圆角元素）');
+    notes.push('C3 cta 无胶囊按钮');
+  }
+
+  // C4：compare 面板是直角（不是 18px 圆角）
+  {
+    const html = shotsC.find((s) => s.layout === 'compare')?.renderedHtml ?? '';
+    if (/border-radius:18px/.test(html)) failures.push('C4 compare 面板出现 18px 圆角（原账号是直角）');
+    notes.push('C4 compare 面板直角');
+  }
 }
 
 /* ------------------------------------------------------------------ */

@@ -2,6 +2,7 @@ import type { ResolvedSpec } from './design/index.js';
 import { badgeText, inlineMotif, type MotifContext } from './design/index.js';
 import { escapeHtml, highlightHtml } from './card-text.js';
 import { stripEmoji } from '../util/text.js';
+import { fitItems } from './design/fit.js';
 
 /**
  * 文案 → 高亮 HTML。
@@ -78,6 +79,21 @@ function bullets(items: string[], spec: ResolvedSpec, ctx: MotifContext): string
         .join('')}
     </div>
     ${showRule ? '' : ''}`;
+}
+
+/**
+ * 复刻模式的条目符号前缀：❌ 红叉 / ✅ 绿勾。
+ *
+ * 339/1 实测：红叉 #E8352A、绿勾 #34CF45，原账号用它们表达「以前/现在」的
+ * 正反两面，没有数字徽章。这里按条序奇偶给符号 —— 语义交给文案，
+ * 符号只区分「否」与「是」。
+ */
+function symbolMark(index: number): string {
+  const isPlus = index % 2 === 1;
+  const color = isPlus ? '#34CF45' : '#E8352A';
+  const glyph = isPlus ? '&#10003;' : '&#10007;';
+  return `<span aria-hidden="true" style="flex:0 0 auto;color:${color};
+    font-size:30px;font-weight:800;line-height:1.1">${glyph}</span>`;
 }
 
 /** 行内小徽章（数字方块）。放在内容流里，不是绝对定位。 */
@@ -306,7 +322,9 @@ function innerBody(
         ${inlineMotif('rule', motifCtx, '', 0)}
         ${b.eyebrow ? `<div class="t-meta latin">${rich(b.eyebrow, spec)}</div>` : ''}
       </div>
-      ${hasItems ? `<div style="flex:1;display:flex;flex-direction:column;justify-content:flex-start;margin:40px 69px 0">${content}</div>` : ''}
+      ${hasItems ? `<div style="display:flex;flex-direction:column;justify-content:flex-start;
+        margin:40px 0 0;background:#E4EEFA;padding:${Math.round(spec.density.gap * 0.9)}px ${Math.round(spec.density.gap * 1.1)}px">
+        ${content}</div>` : ''}
     </div>`;
 }
 
@@ -325,7 +343,14 @@ function list(input: LayoutInput): string {
   const items = raw.slice(0, spec.density.maxItems);
   const family = spec.accountTemplate.family ?? 'generic-enum-v1';
 
-  // 条目本体：两族共用，差异只在骨架（innerBody）
+  /**
+   * 条目本体。
+   *
+   * ⚠️ 复刻模式下**不能用圆角蓝底方块徽章**（badgeMark）—— 原账号没有这个元素。
+   * 339/1 实测：列表项是「❌ 红叉 / ✅ 绿勾」符号前缀 + 深灰文字，
+   * 整块放在浅蓝面板 #E4EEFA 里（bbox y656..1103，通栏）。
+   * 所以复刻模式走 symbolList()，通用模式才用 badgeMark。
+   */
   const itemsHtml = twoColumnWrap(spec, `
       ${items
         .map(
@@ -333,7 +358,7 @@ function list(input: LayoutInput): string {
         <div style="display:flex;gap:22px;align-items:flex-start;
           padding:${Math.round(spec.density.gap * 0.62)}px 0;
           ${i > 0 ? 'border-top:1px solid var(--hairline);' : ''}">
-          <span style="flex:0 0 auto">${badgeMark(spec, badgeText(i))}</span>
+          <span style="flex:0 0 auto">${family === 'generic-enum-v1' ? badgeMark(spec, badgeText(i)) : symbolMark(i)}</span>
           <div style="flex:1;min-width:0">
             <div class="t-body" style="font-size:${spec.type.body + 2}px;font-weight:700">${rich(it.text, spec)}</div>
             ${it.note ? `<div class="t-body cjk" style="font-size:${spec.type.caption}px;opacity:.72;margin-top:8px">${rich(it.note, spec)}</div>` : ''}
@@ -350,7 +375,7 @@ function list(input: LayoutInput): string {
         .map(
           (it, i) => `
         <div style="display:flex;align-items:baseline;gap:34px;
-          padding:34px 0;border-bottom:1px solid var(--hairline)">
+          padding:34px 0;${i < items.length - 1 ? 'border-bottom:1px solid var(--hairline);' : ''}">
           <span style="font-size:26px;font-weight:700;letter-spacing:0.1em;color:var(--accent);
             font-variant-numeric:tabular-nums;flex:0 0 46px">${badgeText(i)}</span>
           <span class="t-title" style="font-family:var(--font-title);
@@ -476,39 +501,72 @@ function compare(input: LayoutInput): string {
     </div>`;
   }
 
-  // 复刻模式（340 实测）：标题 y266 起，双栏对比块从 y≈475 起，
-  // 中间用「→」箭头（原图是细箭头，不是 VS 圆徽章），左列浅底右列强调色底。
+  // 复刻模式（340/2 实测，2026-10-19 sharp 扫描）：
+  //   左列：白底 + 1px 细线框（边框色 #DCDCDE），x 96..469
+  //   右列：**深蓝黑实心块 #0A172A**（x 614..982、高 204px），白字
+  //   中间：蓝色细箭头
+  //   全部**直角** —— 原账号没有圆角元素
+  // ⚠️ 之前这里用的是「右列蓝底 + 圆角 18px」，两处都错：底色应是深蓝黑
+  // 不是强调蓝，而且原账号的框是直角。
+  //
+  // 【内容 fit】两列条目可能装不下（原图每列只有 1~2 条短句）。这里按槽位
+  // 容量算一遍：装得下用原字号，装不下按有限档位缩字号（最低 22px），
+  // 仍然装不下就裁剪保护 + 由上层拆页/阻断（design/fit.ts 的处理顺序）。
+  const colCapacity = {
+    width: 380,
+    height: 204 - Math.round(spec.density.gap * 1.6),
+    lineHeight: 1.6,
+    fontSize: spec.type.body,
+    gap: Math.round(spec.density.gap * 0.4),
+    maxItems: 4,
+  };
+  const allColItems = [
+    ...(left.items ?? []),
+    ...(right.items ?? []),
+  ];
+  const fit = fitItems(allColItems, colCapacity);
+  const colFont = fit.finalFontSize;
+
+  //   左列：白底 + 1px 细线框（边框色 #DCDCDE），x 96..469
+  //   右列：**深蓝黑实心块 #0A172A**（x 614..982、高 204px），白字
+  //   中间：蓝色细箭头
+  //   全部**直角** —— 原账号没有圆角元素
+  // ⚠️ 之前这里用的是「右列蓝底 + 圆角 18px」，两处都错：底色应是深蓝黑
+  // 不是强调蓝，而且原账号的框是直角。
   return `
     <div style="display:flex;flex-direction:column;height:100%">
       ${b.title ? `<h2 class="t-title" style="font-family:var(--font-title);
-        font-size:${Math.round(spec.type.title * 0.74)}px;margin:calc(266px - var(--pad-top, 0px)) calc(69px - var(--pad-x, 0px)) 0;line-height:1.3">${rich(b.title, spec)}</h2>` : ''}
+        font-size:${Math.round(spec.type.title * 0.6)}px;margin:calc(266px - var(--pad-top, 0px)) calc(69px - var(--pad-x, 0px)) 0;line-height:1.3;
+        white-space:nowrap">${rich(b.title, spec)}</h2>` : ''}
 
-      <div style="margin:calc(475px - var(--pad-top, 0px)) calc(69px - var(--pad-x, 0px)) 0;display:flex;align-items:stretch;gap:0;position:relative">
-        <div style="flex:1;min-width:0;background:var(--panel);
-          padding:${Math.round(spec.density.gap * 0.8)}px;border-radius:18px">
+      <div style="margin:calc(475px - var(--pad-top, 0px)) calc(69px - var(--pad-x, 0px)) 0;display:flex;align-items:stretch;gap:0;position:relative;min-height:204px">
+        <div style="flex:1;min-width:0;background:#FFFFFF;
+          box-shadow:inset 0 0 0 1px #DCDCDE;overflow:hidden;
+          padding:${Math.round(spec.density.gap * 0.8)}px">
           <div class="t-meta latin" style="font-weight:700;margin-bottom:16px;color:var(--ink-soft)">
             ${escapeHtml(left.title ?? '')}</div>
           ${(left.items ?? []).slice(0, 4).map((t) => `
-            <div class="t-body cjk" style="font-size:${spec.type.body}px;line-height:1.6;
+            <div class="t-body cjk" style="font-size:${colFont}px;line-height:1.6;
               margin-bottom:10px">${rich(t, spec)}</div>`).join('')}
         </div>
-        <div style="flex:0 0 76px;display:flex;align-items:center;justify-content:center;
-          font-size:40px;font-weight:800;color:var(--accent)">&#8594;</div>
-        <div style="flex:1;min-width:0;background:var(--accent);color:var(--on-accent);
-          padding:${Math.round(spec.density.gap * 0.8)}px;border-radius:18px">
-          <div class="t-meta latin" style="font-weight:700;margin-bottom:16px;opacity:.85">
+        <div style="flex:0 0 145px;display:flex;align-items:center;justify-content:center;
+          font-size:40px;font-weight:800;color:var(--accent);line-height:1">&#8594;</div>
+        <div style="flex:1;min-width:0;background:#0A172A;color:#FFFFFF;overflow:hidden;
+          padding:${Math.round(spec.density.gap * 0.8)}px">
+          <div class="t-meta latin on-accent" style="font-weight:700;margin-bottom:16px;opacity:.62">
             ${escapeHtml(right.title ?? '')}</div>
           ${(right.items ?? []).slice(0, 4).map((t) => `
-            <div class="t-body cjk" style="font-size:${spec.type.body}px;line-height:1.6;
+            <div class="t-body cjk on-accent" style="font-size:${colFont}px;line-height:1.6;
               margin-bottom:10px">${rich(t, spec)}</div>`).join('')}
         </div>
       </div>
 
       ${b.conclusion ? `
-        <div style="margin:44px 0 0;padding:30px 34px;
-          border-left:6px solid var(--accent);background:var(--panel)">
-          <div class="t-body" style="font-size:${spec.type.body + 4}px;font-weight:700;line-height:1.5">${rich(b.conclusion, spec)}</div>
+        <div style="margin:40px 0 0;padding:26px 30px;
+          border-left:6px solid var(--accent);background:#F5F6F8;overflow:hidden">
+          <div class="t-body" style="font-size:${Math.round(spec.type.body * 0.9)}px;font-weight:700;line-height:1.5">${rich(b.conclusion, spec)}</div>
         </div>` : ''}
+      <div style="flex:1"></div>
     </div>`;
 }
 
@@ -558,7 +616,7 @@ function photoText(input: LayoutInput): string {
     <div style="position:relative;display:flex;flex-direction:column;height:100%">
       ${b.title ? `<h2 class="t-title" style="font-family:var(--font-title);
         font-size:${Math.round(spec.type.title * 0.7)}px;margin:calc(266px - var(--pad-top, 0px)) calc(69px - var(--pad-x, 0px)) 0;line-height:1.3">${rich(b.title, spec)}</h2>` : ''}
-      <div style="margin:calc(430px - var(--pad-top, 0px)) calc(69px - var(--pad-x, 0px)) 0;border-radius:18px;overflow:hidden;
+      <div style="margin:calc(430px - var(--pad-top, 0px)) calc(69px - var(--pad-x, 0px)) 0;overflow:hidden;
         background-image:url('${photoDataUri}');background-size:cover;background-position:center;
         aspect-ratio:4/3"></div>
       ${b.subtitle ? `<div class="t-body cjk" style="margin:30px 0 0;opacity:.86">${rich(b.subtitle, spec)}</div>` : ''}
@@ -595,19 +653,20 @@ function cta(input: LayoutInput): string {
   const { blocks: b, spec, pageNo, motifCtx } = input;
   const family = spec.accountTemplate.family ?? 'generic-enum-v1';
 
-  // 复刻模式：收尾页与内页同骨架（左上编号 + 标题 y266 + 行动块），
-  // 不是通用模式的居中胶囊。原账号的收尾页同样是左对齐版式。
+  // 复刻模式：收尾页与内页同骨架（左上编号 + 标题 y266）。
+  // ⚠️ **没有按钮**。原账号的收尾（340/4 实测）是两行加粗文字 + 蓝色强调句：
+  //   「做视觉升级、内容营销?」黑粗
+  //   「可以聊聊，我们帮你一起梳理。」其中关键句是蓝色
+  // 之前渲染成蓝色胶囊按钮 + 箭头 —— 原账号从来没有圆角胶囊元素。
   if (family !== 'generic-enum-v1') {
     return `
     <div style="display:flex;flex-direction:column;height:100%">
       ${b.title ? `<h2 class="t-title" style="font-family:var(--font-title);
         font-size:${Math.round(spec.type.title * 0.74)}px;margin:calc(266px - var(--pad-top, 0px)) calc(69px - var(--pad-x, 0px)) 0;line-height:1.3">${rich(b.title, spec)}</h2>` : ''}
       ${b.action ? `
-        <div style="margin:calc(475px - var(--pad-top, 0px)) calc(69px - var(--pad-x, 0px)) 0;display:inline-flex;align-self:flex-start;align-items:center;gap:18px;
-          padding:32px 46px;border-radius:999px;
-          background:var(--accent);color:var(--on-accent)">
-          <span class="t-body" style="font-size:${spec.type.body + 6}px;font-weight:800">${rich(b.action, spec)}</span>
-          <span style="font-size:34px;line-height:1">&#8594;</span>
+        <div style="margin:calc(560px - var(--pad-top, 0px)) calc(69px - var(--pad-x, 0px)) 0">
+          <div class="t-title" style="font-family:var(--font-title);
+            font-size:${Math.round(spec.type.body * 1.35)}px;font-weight:800;line-height:1.55">${rich(b.action, spec)}</div>
         </div>` : ''}
       <div style="flex:1"></div>
     </div>`;
