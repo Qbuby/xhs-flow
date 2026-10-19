@@ -43,6 +43,13 @@ export function Drafts() {
     });
   }
 
+  /** 全选/取消当前可见的待审核稿。 */
+  function toggleAll() {
+    const ids = drafts.filter((d) => d.status === 'pending').map((d) => d.id);
+    const allSelected = ids.length > 0 && ids.every((id) => selected.has(id));
+    setSelected(allSelected ? new Set() : new Set(ids));
+  }
+
   async function bulkApprove() {
     if (selected.size === 0) return;
     if (!confirm(`通过选中的 ${selected.size} 篇草稿？通过后可在「发布」页发出。`)) return;
@@ -56,15 +63,50 @@ export function Drafts() {
     }
   }
 
+  /**
+   * 批量拒绝。
+   *
+   * 与批量通过对称，但**语气要更谨慎**：拒绝是不可逆的状态流转，
+   * 且用户往往是「这批都不行」而非「这几篇不行」，所以单独确认并说清后果
+   * （只改状态、不删数据，可到「已拒绝」标签找回）。
+   */
+  async function bulkReject() {
+    if (selected.size === 0) return;
+    if (
+      !confirm(
+        `拒绝选中的 ${selected.size} 篇草稿？\n\n只会把状态改为「已拒绝」，不会删除内容，` +
+          '之后可以在「已拒绝」标签里找回。',
+      )
+    ) {
+      return;
+    }
+    try {
+      await api.post('/api/drafts/bulk-reject', { ids: [...selected] });
+      toast(`已拒绝 ${selected.size} 篇`);
+      setSelected(new Set());
+      void load();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), 'err');
+    }
+  }
+
+  const pendingVisible = drafts.filter((d) => d.status === 'pending').length;
+  const allSelected = pendingVisible > 0 && pendingVisible === selected.size;
+
   return (
     <div>
       <SectionTitle
         title="草稿审核"
         desc="逐篇确认后才会发布到你的小红书"
         action={
-          <button className="btn-primary" disabled={selected.size === 0} onClick={() => void bulkApprove()}>
-            批量通过（{selected.size}）
-          </button>
+          <div className="flex items-center gap-2">
+            <button className="btn-ghost" disabled={selected.size === 0} onClick={() => void bulkReject()}>
+              批量拒绝{selected.size > 0 ? `（${selected.size}）` : ''}
+            </button>
+            <button className="btn-primary" disabled={selected.size === 0} onClick={() => void bulkApprove()}>
+              批量通过{selected.size > 0 ? `（${selected.size}）` : ''}
+            </button>
+          </div>
         }
       />
 
@@ -81,6 +123,21 @@ export function Drafts() {
           </button>
         ))}
       </div>
+
+      {tab === 'pending' && pendingVisible > 0 && (
+        <label className="flex items-center gap-2 text-xs text-ink-500 mb-2 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={allSelected}
+            onChange={toggleAll}
+            className="w-4 h-4 accent-accent-500"
+          />
+          全选本页 {pendingVisible} 篇待审核
+          {selected.size > 0 && !allSelected && (
+            <span className="text-ink-400">（已选 {selected.size}）</span>
+          )}
+        </label>
+      )}
 
       {loading ? (
         <Spinner />

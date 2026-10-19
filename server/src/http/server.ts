@@ -634,6 +634,25 @@ export async function buildServer() {
     return { ok: true, n: ids.length };
   });
 
+  /**
+   * 批量拒绝。
+   *
+   * 为什么必须有：审核页只有「批量通过」，没有拒绝 —— 于是用户只能逐篇点开
+   * 详情页再点拒绝，或者干脆放着让待审核越积越多。拒绝是个高频动作，
+   * 尤其是定时创作一次产 5 篇、其中 3 篇题材跑偏的时候。
+   *
+   * 只改状态，不删数据：草稿正文本身往往写得不错（实测题材跑偏的那些稿
+   * 质量并不差），删掉就再也看不到问题出在哪。
+   */
+  app.post('/api/drafts/bulk-reject', async (req) => {
+    const { ids } = (req.body ?? {}) as { ids?: number[] };
+    if (!ids?.length) return { error: '缺少 ids' };
+    for (const id of ids) {
+      run("UPDATE drafts SET status='rejected', updated_at=datetime('now') WHERE id=?", id);
+    }
+    return { ok: true, n: ids.length };
+  });
+
   /* ---------------- 生成 ---------------- */
 
   app.post('/api/compose', async (req, reply) => {
