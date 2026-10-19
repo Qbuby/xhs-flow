@@ -66,9 +66,14 @@ export interface Health {
   scheduler: {
     running: boolean;
     generate: string;
+    /** 实际已注册的 cron。设置有值 ≠ 已注册，界面必须看这个。 */
+    registeredCrons: Record<string, string>;
+    generateRegistered: boolean;
+    rescrapeRegistered: boolean;
     pending: number;
     running_jobs: number;
     failed: number;
+    lastCompose: string | null;
   };
 }
 

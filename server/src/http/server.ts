@@ -30,7 +30,7 @@ import { signerState, resetSigner } from '../xhs/signing.js';
 import { getStyleProfile } from '../corpus/profile.js';
 import { composeDraft, ideateTopics, renderDraftCards } from '../generate/pipeline.js';
 import { renderCard, toResolved } from '../generate/cards.js';
-import { enqueue, schedulerInfo, runNow } from '../scheduler/jobs.js';
+import { enqueue, schedulerInfo, runNow, reloadCrons } from '../scheduler/jobs.js';
 import { approvedDrafts } from '../xhs/publish.js';
 import { exportCorpusZip, importCorpusZip } from '../corpus/transfer.js';
 import { createZip, type ZipEntryInput } from '../util/zip.js';
@@ -133,6 +133,18 @@ export async function buildServer() {
       rescrapeBatch: Number(getSetting('rescrape_batch') ?? '30'),
       // 冷静期（本地时间字符串，空 = 未启用）
       pauseUntil: getSetting('pause_until') ?? '',
+      // 实际注册状态。设置里有表达式 ≠ cron 已注册 —— 创作台必须按这个显示，
+      // 否则会出现「已开启 / 下次 15:00 / 运行中」但永远不创作的情况。
+      // 只取需要的字段：schedulerInfo() 也带 generate，直接展开会覆盖上面的值。
+      ...(() => {
+        const si = schedulerInfo();
+        return {
+          generateRegistered: si.generateRegistered,
+          rescrapeRegistered: si.rescrapeRegistered,
+          registeredCrons: si.registeredCrons,
+          lastCompose: si.lastCompose,
+        };
+      })(),
     },
     nextRun: nextRunTimes(),
     };
@@ -190,7 +202,12 @@ export async function buildServer() {
         }
       }
     }
-    return { ok: true, nextRun: nextRunTimes() };
+    // 立刻按新设置重注册 cron。之前只在进程启动时注册一次，用户改了时间
+    // 必须重启服务才生效 —— 于是界面显示「已开启 / 下次 15:00 / 定时创作运行中」，
+    // 实际那个 cron 从来没被注册过，永远不会创作。
+    reloadCrons();
+
+    return { ok: true, nextRun: nextRunTimes(), scheduler: schedulerInfo() };
   });
 
   /** 创作台：跨语料源的选题总览 */

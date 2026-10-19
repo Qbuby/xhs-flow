@@ -44,6 +44,11 @@ interface Settings {
     autoIdeate?: boolean;
     composePerRun?: number;
     ideatePerRun?: number;
+    /** 定时创作 cron 是否真的注册了（设置有值 ≠ 已注册） */
+    generateRegistered?: boolean;
+    rescrapeRegistered?: boolean;
+    /** 上次成功产出草稿的时间 */
+    lastCompose?: string | null;
   };
   nextRun?: { generate: string | null };
 }
@@ -363,8 +368,27 @@ export function Studio() {
             保存定时设置
           </button>
           <span className="text-xs text-ink-400 flex items-center gap-1.5">
-            <Dot ok={draftAutoCompose.value} />
-            {draftAutoCompose.value ? '定时创作运行中' : '定时创作未开启'}
+            {/* 三种状态，不能只看开关：开关开着但 cron 没注册过的情况真实发生过，
+                界面却一直显示「运行中」。现在以服务端的注册状态为准。 */}
+            {!draftAutoCompose.value ? (
+              <>
+                <Dot ok={false} />
+                定时创作未开启
+              </>
+            ) : settings?.schedule.generateRegistered ? (
+              <>
+                <Dot ok />
+                定时创作运行中
+                {settings.schedule.lastCompose
+                  ? ` · 上次 ${settings.schedule.lastCompose}`
+                  : ' · 尚未产出过'}
+              </>
+            ) : (
+              <>
+                <Dot ok={false} />
+                开关已开但定时任务未注册 —— 需重启服务
+              </>
+            )}
           </span>
         </div>
       </Card>

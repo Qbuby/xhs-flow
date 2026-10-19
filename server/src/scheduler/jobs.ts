@@ -350,8 +350,21 @@ async function tick(): Promise<void> {
 
 const timers: Array<() => void> = [];
 
+/**
+ * 注册一个 cron。
+ *
+ * ⚠️ `pattern` 为空时**不是「跳过」，而是「注销并记录」**：定时创作曾经
+ * 在服务启动时因为 `schedule_generate` 还是空串而完全没注册，之后用户在
+ * 界面保存了表达式也不会补注册 —— 表现是「已开启、下次 15:00、定时创作
+ * 运行中」，但永远不会创作。界面那个「下次时间」是拿当前设置算的，与
+ * 是否真的注册过毫无关系。
+ */
 function scheduleCron(name: string, pattern: string, fn: () => void): void {
-  if (!pattern) return;
+  if (!pattern.trim()) {
+    registeredCrons.delete(name);
+    logger.warn({ name }, '定时表达式为空，该任务未注册（不会触发）');
+    return;
+  }
   try {
     const cron = new Cron(pattern, { timezone: Intl.DateTimeFormat().resolvedOptions().timeZone }, () => {
       logger.info({ name }, '定时任务触发');
@@ -362,10 +375,39 @@ function scheduleCron(name: string, pattern: string, fn: () => void): void {
       }
     });
     timers.push(() => cron.stop());
+    registeredCrons.set(name, pattern);
     logger.info({ name, pattern }, '已注册定时任务');
   } catch (err) {
+    registeredCrons.delete(name);
     logger.error({ err, name, pattern }, '定时表达式无效');
   }
+}
+
+/** 实际已注册的 cron（name → 表达式）。给 schedulerInfo 用。 */
+const registeredCrons = new Map<string, string>();
+
+/**
+ * 重新注册定时任务（设置变更后调用）。
+ *
+ * 旧实现只在进程启动时注册一次，用户在界面改时间必须重启服务才生效。
+ * 这里停掉旧的、按新设置重建，并记下每个任务是不是真的注册成功了。
+ */
+export function reloadCrons(): void {
+  for (const stop of timers) stop();
+  timers.length = 0;
+  registeredCrons.clear();
+
+  scheduleCron(
+    'generate',
+    getSetting('schedule_generate') ?? config.schedule.generate,
+    runGenerateSchedule,
+  );
+  scheduleCron('rescrape', getSetting('schedule_rescrape') || '40 10 * * *', runRescrapeSchedule);
+
+  logger.info(
+    { registered: Object.fromEntries(registeredCrons) },
+    '定时任务已按当前设置重新注册',
+  );
 }
 
 /** 所有已启用的语料源 id */
@@ -422,65 +464,8 @@ export function startScheduler(): void {
   reclaimOrphanJobs();
   setInterval(() => void tick(), 15_000).unref?.();
 
-  // 定时创作：按设置来，不再写死在 .env
-  scheduleCron(
-    'generate',
-    (getSetting('schedule_generate') ?? config.schedule.generate) || '',
-    () => {
-      const autoCompose = (getSetting('auto_compose') ?? 'false') === 'true';
-      if (!autoCompose) {
-        logger.info('定时创作未开启，跳过');
-        return;
-      }
-
-      const perSource = Number(getSetting('compose_per_run') ?? '1');
-      const autoIdeate = (getSetting('auto_ideate') ?? 'true') === 'true';
-      const ideateCount = Number(getSetting('ideate_per_run') ?? '6');
-
-      for (const sourceId of activeSourceIds()) {
-        // 选题池空了就没东西可写 —— 先自动补一批选题，
-        // 否则这个定时任务每天都在空转
-        const open = get<{ c: number }>(
-          `SELECT COUNT(*) AS c FROM topics WHERE source_id = ? AND status = 'open'`,
-          sourceId,
-        );
-        if ((open?.c ?? 0) < perSource && autoIdeate) {
-          enqueue('ideate', { sourceId, count: ideateCount });
-        }
-        for (let i = 0; i < perSource; i++) {
-          enqueue('compose', { sourceId }, { dedupeKey: `compose:${sourceId}:${i}` });
-        }
-      }
-    },
-  );
-
-  // 自动续抓：到点给开了开关的语料源补新作品。
-  // 默认时间从 04:00 挪到 10:40 —— 凌晨四点爬起来翻别人主页，
-  // 在「活跃时段」这一维上就直接对不上真人了。而且 04:00 落在安静时段里，
-  // 任务会被闸门拦下，看起来像「点了没反应」。10:40 也不是整点，避开 cron 的整齐感。
-  scheduleCron(
-    'rescrape',
-    getSetting('schedule_rescrape') || '40 10 * * *',
-    () => {
-      const batch = Number(getSetting('rescrape_batch') ?? '30');
-      const rows = all<{ id: number; profile_url: string; note_count: number }>(
-        `SELECT id, profile_url, note_count FROM sources
-         WHERE auto_scrape = 1 AND status = 'active'`,
-      );
-      if (rows.length === 0) {
-        logger.info('没有开启自动续抓的语料源');
-        return;
-      }
-      for (const r of rows) {
-        enqueue(
-          'scrape',
-          { profileUrl: r.profile_url, maxNotes: 1000, maxNew: batch, downloadImages: true },
-          { dedupeKey: `scrape:${r.id}` },
-        );
-      }
-      logger.info({ count: rows.length, batch }, '已排入自动续抓');
-    },
-  );
+  // 定时创作 + 自动续抓：交给 reloadCrons 统一注册（设置变更时可重复调用）
+  reloadCrons();
 
   // 会话健康检查：web_session 服务端会悄悄过期，早点发现好过发布失败才发现。
   //
@@ -490,6 +475,68 @@ export function startScheduler(): void {
   scheduleHealthcheck();
 
   void tick();
+}
+
+/** 定时创作到点：检查开关、补选题、排创作任务。 */
+function runGenerateSchedule(): void {
+  const autoCompose = (getSetting('auto_compose') ?? 'false') === 'true';
+  if (!autoCompose) {
+    logger.info('定时创作未开启，跳过');
+    return;
+  }
+
+  const perSource = Number(getSetting('compose_per_run') ?? '1');
+  const autoIdeate = (getSetting('auto_ideate') ?? 'true') === 'true';
+  const ideateCount = Number(getSetting('ideate_per_run') ?? '6');
+  const sources = activeSourceIds();
+
+  if (sources.length === 0) {
+    logger.warn('没有启用中的语料源，定时创作无事可做');
+    return;
+  }
+
+  for (const sourceId of sources) {
+    // 选题池空了就没东西可写 —— 先自动补一批选题，
+    // 否则这个定时任务每天都在空转
+    const open = get<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM topics WHERE source_id = ? AND status = 'open'`,
+      sourceId,
+    );
+    if ((open?.c ?? 0) < perSource && autoIdeate) {
+      enqueue('ideate', { sourceId, count: ideateCount });
+    }
+    for (let i = 0; i < perSource; i++) {
+      enqueue('compose', { sourceId }, { dedupeKey: `compose:${sourceId}:${i}` });
+    }
+  }
+  logger.info({ sources, perSource }, '已排入定时创作');
+}
+
+/**
+ * 自动续抓到点：给开了开关的语料源补新作品。
+ *
+ * 默认时间从 04:00 挪到 10:40 —— 凌晨四点爬起来翻别人主页，
+ * 在「活跃时段」这一维上就直接对不上真人了。而且 04:00 落在安静时段里，
+ * 任务会被闸门拦下，看起来像「点了没反应」。10:40 也不是整点，避开 cron 的整齐感。
+ */
+function runRescrapeSchedule(): void {
+  const batch = Number(getSetting('rescrape_batch') ?? '30');
+  const rows = all<{ id: number; profile_url: string; note_count: number }>(
+    `SELECT id, profile_url, note_count FROM sources
+     WHERE auto_scrape = 1 AND status = 'active'`,
+  );
+  if (rows.length === 0) {
+    logger.info('没有开启自动续抓的语料源');
+    return;
+  }
+  for (const r of rows) {
+    enqueue(
+      'scrape',
+      { profileUrl: r.profile_url, maxNotes: 1000, maxNew: batch, downloadImages: true },
+      { dedupeKey: `scrape:${r.id}` },
+    );
+  }
+  logger.info({ count: rows.length, batch }, '已排入自动续抓');
 }
 
 export function stopScheduler(): void {
@@ -503,12 +550,26 @@ export function stopScheduler(): void {
 }
 
 export function schedulerInfo() {
+  const generatePattern = getSetting('schedule_generate') ?? config.schedule.generate;
+  const registered = Object.fromEntries(registeredCrons);
   return {
     running: !stopped,
-    generate: getSetting('schedule_generate') ?? config.schedule.generate,
+    generate: generatePattern,
+    /**
+     * 实际已注册的 cron。界面的「定时创作运行中」必须看它，
+     * 而不是看设置里有没有表达式 —— 设置有值但没注册过的情况真实发生过，
+     * 表现为界面一直显示运行中、却永远不创作。
+     */
+    registeredCrons: registered,
+    generateRegistered: registeredCrons.has('generate'),
+    rescrapeRegistered: registeredCrons.has('rescrape'),
     pending: get<{ c: number }>(`SELECT COUNT(*) AS c FROM jobs WHERE status='pending'`)?.c ?? 0,
     running_jobs: get<{ c: number }>(`SELECT COUNT(*) AS c FROM jobs WHERE status='running'`)?.c ?? 0,
     failed: get<{ c: number }>(`SELECT COUNT(*) AS c FROM jobs WHERE status='failed'`)?.c ?? 0,
+    lastCompose: get<{ finished_at: string | null }>(
+      `SELECT finished_at FROM jobs WHERE type='compose' AND status='done'
+        ORDER BY finished_at DESC LIMIT 1`,
+    )?.finished_at ?? null,
   };
 }
 

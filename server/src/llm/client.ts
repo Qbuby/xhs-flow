@@ -20,10 +20,26 @@ import { extractJson } from '../util/text.js';
 let openaiClient: OpenAI | null = null;
 let openaiKey = '';
 
-function getOpenAI(baseURL: string, apiKey: string): OpenAI {
-  const sig = `${baseURL}|${apiKey}`;
+/**
+ * 请求超时。
+ *
+ * ⚠️ 之前**完全没有超时**，Node fetch 默认无限等。实测 MiniMax-M3.1 产出一篇
+ * 完整图文（7 张卡、2500+ 字）要 90 秒以上，蒸馏带视觉的请求更久；上游中途
+ * 掐连接时就表现为 `fetch failed`，任务反复重试却看不出是超时还是断网。
+ *
+ * 分档：普通对话 180s、带图 300s、创作类长输出 420s（按 maxTokens 放大）。
+ * 超时要报**可识别**的错误文案，走既有重试路径，不当成不可重试。
+ */
+function timeoutForMs(maxTokens: number, hasImages: boolean): number {
+  if (hasImages) return 300_000;
+  // 经验值：MiniMax-M3.1 每 1k 输出 token 约 8~10s（推理模型还要 thinking）
+  return Math.max(180_000, Math.min(420_000, maxTokens * 12));
+}
+
+function getOpenAI(baseURL: string, apiKey: string, timeoutMs: number): OpenAI {
+  const sig = `${baseURL}|${apiKey}|${timeoutMs}`;
   if (openaiClient && openaiKey === sig) return openaiClient;
-  openaiClient = new OpenAI({ baseURL, apiKey, maxRetries: 2 });
+  openaiClient = new OpenAI({ baseURL, apiKey, maxRetries: 2, timeout: timeoutMs });
   openaiKey = sig;
   return openaiClient;
 }
@@ -74,6 +90,7 @@ async function callAnthropic(opts: ChatOptions, maxTokens: number): Promise<Anth
     stream: false,
   };
 
+  const timeoutMs = timeoutForMs(maxTokens, Boolean(opts.images?.length));
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -82,6 +99,13 @@ async function callAnthropic(opts: ChatOptions, maxTokens: number): Promise<Anth
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
+  }).catch((err: unknown) => {
+    const e = err as { name?: string; message?: string };
+    if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
+      throw new Error(`Anthropic 请求超时（${Math.round(timeoutMs / 1000)}s，max_tokens=${maxTokens}）`);
+    }
+    throw err;
   });
 
   const text = await res.text();
@@ -151,11 +175,13 @@ async function chatOpenAI(opts: ChatOptions): Promise<string> {
       : opts.user,
   });
 
-  const res = await getOpenAI(cfg.baseURL, cfg.apiKey).chat.completions.create({
+  const maxTokens = opts.maxTokens ?? 4096;
+  const res = await getOpenAI(cfg.baseURL, cfg.apiKey, timeoutForMs(maxTokens, Boolean(opts.images?.length)))
+    .chat.completions.create({
     model: cfg.model,
     messages,
     temperature: opts.temperature ?? 0.8,
-    max_completion_tokens: opts.maxTokens ?? 4096,
+    max_completion_tokens: maxTokens,
     ...(opts.jsonMode ? { response_format: { type: 'json_object' as const } } : {}),
   });
 

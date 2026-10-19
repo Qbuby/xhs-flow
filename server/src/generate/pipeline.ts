@@ -254,11 +254,31 @@ export async function composeDraft(opts: {
     .filter(Boolean)
     .join('\n');
 
-  const raw = await chatJson<Draft>({ system: SYSTEM, user, temperature: 0.85, maxTokens: 16_384 });
+  const raw = await chatJson<Record<string, unknown>>({
+    system: SYSTEM, user, temperature: 0.85, maxTokens: 16_384,
+  });
 
+  // 与 ideate 同理：模型可能返回中文键（标题/正文/卡片），先做一次键名归一，
+  // 免得后面只能靠「空内容即报错」把整轮创作打断。
+  const normalized = normalizeDraftShape(raw);
 
-  const draft = coerceDraft(raw);
+  const draft = coerceDraft(normalized);
 
+  // ⚠️ 不允许「静默降级」。模型返回中文键（`标题`/`正文`/`卡片`）时，
+  // coerceDraft 会兜底成「未命名笔记 + 一张空封面」并正常落库 —— 界面看不出
+  // 异常，只是内容全空。实测 MiniMax-M3.1 在没有 JSON 约束时就会这样。
+  // 这里做结构性检查：无正文或卡片无内容 → 明确失败，不写库。
+  if (!draft.body.trim()) {
+    throw new Error(
+      `创作返回的正文为空（模型顶层键：${
+        raw && typeof raw === 'object' ? Object.keys(raw as object).slice(0, 8).join(',') : typeof raw
+      }）。这是字段名不匹配，不是模型没写 —— 不要落库成空稿。`,
+    );
+  }
+  const cardsWithText = draft.cards.filter((c) => JSON.stringify(c.blocks).length > 12);
+  if (cardsWithText.length === 0) {
+    throw new Error('创作返回的卡片全部没有内容，拒绝落库（模型返回形状与契约不符）');
+  }
   /* --- 落库 --- */
   const ins = run(
     `INSERT INTO drafts(source_id, title, body, tags, status, ref_note_ids)
@@ -343,15 +363,38 @@ function normalizeBody(raw: string): string {
   return paras.join('\n\n');
 }
 
+/**
+ * 归一模型返回的键名：约定是 title/body/tags/cards，但模型经常给中文键。
+ *
+ * 与 extractTopics 同源的问题：模型的 JSON 形状不可信。与其让下游用
+ * 「空内容即报错」把整轮创作打断，不如在这里认一下常见别名。认不出来就
+ * 原样返回，交给下游的结构校验报错 —— 归一不负责猜内容。
+ */
+function normalizeDraftShape(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const o = raw as Record<string, unknown>;
+  const pick = (...keys: string[]): unknown => {
+    for (const k of keys) if (o[k] !== undefined) return o[k];
+    return undefined;
+  };
+  const title = pick('title', '标题');
+  const body = pick('body', '正文', 'content', 'desc');
+  const tags = pick('tags', '标签', '话题');
+  const cards = pick('cards', '卡片', 'images', 'slides');
+  if (title === undefined && body === undefined && cards === undefined) return o;
+  return { ...o, title, body, tags, cards };
+}
+
 /** 模型偶尔不守 schema，这里硬兜底，保证下游渲染器拿到的形状永远是对的。 */
-function coerceDraft(raw: Draft): Draft {
-  const title = String(raw.title ?? '').trim().slice(0, 20) || '未命名笔记';
-  const body = normalizeBody(String(raw.body ?? '')).slice(0, 1000);
-  const tags = Array.isArray(raw.tags) ? raw.tags.map((t) => String(t).replace(/^#/, '')).filter(Boolean) : [];
+function coerceDraft(raw: unknown): Draft {
+  const o = (raw ?? {}) as Record<string, unknown>;
+  const title = String(o.title ?? '').trim().slice(0, 20) || '未命名笔记';
+  const body = normalizeBody(String(o.body ?? '')).slice(0, 1000);
+  const tags = Array.isArray(o.tags) ? (o.tags as unknown[]).map((t) => String(t).replace(/^#/, '')).filter(Boolean) : [];
 
-  let cards = Array.isArray(raw.cards) ? raw.cards : [];
+  let cards = Array.isArray(o.cards) ? (o.cards as Array<Record<string, unknown>>) : [];
 
-  cards = cards.map((c, i) => {
+  cards = cards.map((c: Record<string, unknown>, i: number) => {
     const layout = LAYOUTS.includes(c?.layout as Layout) ? (c.layout as Layout) : i === 0 ? 'cover' : 'list';
     let blocks: Record<string, unknown> =
       c?.blocks && typeof c.blocks === 'object' && !Array.isArray(c.blocks)
@@ -370,8 +413,8 @@ function coerceDraft(raw: Draft): Draft {
       if (Object.keys(flat).length > 0) blocks = flat;
     }
 
-    return { layout, blocks, photoQuery: c?.photoQuery };
-  });
+    return { layout, blocks, photoQuery: c?.photoQuery as string | undefined };
+  }) as Draft['cards'];
 
   // 封面必须有
   if (cards.length === 0 || cards[0]?.layout !== 'cover') {
@@ -382,7 +425,7 @@ function coerceDraft(raw: Draft): Draft {
   }
   if (cards.length > 10) cards = cards.slice(0, 10);
 
-  return { title, body, tags, cards };
+  return { title, body, tags, cards: cards as Draft['cards'] };
 }
 
 /**
@@ -473,6 +516,59 @@ const IDEATE_SYSTEM = `你是一位小红书选题策划。给定一个博主的
 - 覆盖不同的内容类型，不要全是同一类
 - 不要重复已有的老选题，除非能从新角度重做`;
 
+/**
+ * 从模型返回里挖出选题数组。
+ *
+ * ⚠️ 模型不保证守 schema。实测 MiniMax-M3.1 在没有 JSON 模板约束时返回的是
+ * **中文键** `选题`，每项标题字段是 `选题标题`（2026-10-19 实测）。旧实现只认
+ * `raw.topics`，取不到就 `Array.isArray(...) ? ... : []` 静默清空 —— ideate 任务
+ * 被标记为 done 却一条没插，定时创作从此每天空转，界面上完全看不出来。
+ *
+ * 这里按「数组候选键 × 标题候选字段」两级容错，并兜底嵌套一层与「顶层单条」。
+ */
+function extractTopics(raw: unknown): Array<{ title: string; angle: string; brief: string }> {
+  const out: Array<{ title: string; angle: string; brief: string }> = [];
+  if (!raw || typeof raw !== 'object') return out;
+  const root = raw as Record<string, unknown>;
+
+  const ARRAY_KEYS = ['topics', '选题', '选题列表', 'list', 'items', 'data', 'result'];
+  const TITLE_KEYS = ['title', '选题标题', '标题', 'topic', 'name'];
+  const ANGLE_KEYS = ['angle', '切入角度', '角度'];
+  const BRIEF_KEYS = ['brief', '内容要求', '说明', '核心创意', 'desc', 'description'];
+
+  const pickStr = (obj: Record<string, unknown>, keys: string[]): string => {
+    for (const k of keys) {
+      const v = obj[k];
+      if (typeof v === 'string' && v.trim()) return v.trim();
+    }
+    return '';
+  };
+
+  for (const k of ARRAY_KEYS) {
+    if (!Array.isArray(root[k])) continue;
+    for (const item of root[k] as unknown[]) {
+      if (!item || typeof item !== 'object') continue;
+      const o = item as Record<string, unknown>;
+      const title = pickStr(o, TITLE_KEYS);
+      if (!title) continue;
+      out.push({ title, angle: pickStr(o, ANGLE_KEYS), brief: pickStr(o, BRIEF_KEYS) });
+    }
+    if (out.length > 0) return out;
+  }
+
+  // 兜底一：嵌套一层（{data:{topics:[...]}} / {result:{选题:[...]}}）
+  for (const v of Object.values(root)) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const nested = extractTopics(v);
+      if (nested.length > 0) return nested;
+    }
+  }
+  // 兜底二：顶层本身就是一条选题
+  const single = pickStr(root, TITLE_KEYS);
+  if (single) return [{ title: single, angle: pickStr(root, ANGLE_KEYS), brief: pickStr(root, BRIEF_KEYS) }];
+  return out;
+}
+
 export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{ title: string; angle: string; brief: string }>> {
   const profile = getStyleProfile(sourceId)?.profile ?? null;
 
@@ -489,7 +585,7 @@ export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{
     ? profile.topic_map.map((t) => `- ${t.topic}（${t.note_count} 篇 / 均赞 ${t.avg_liked}）`).join('\n')
     : '（无历史分布）';
 
-  const raw = await chatJson<{ topics: Array<{ title: string; angle: string; brief: string }> }>({
+  const raw = await chatJson<Record<string, unknown>>({
     system: IDEATE_SYSTEM,
     user: [
       `【博主风格】${profile?.persona.one_liner ?? '未知'}`,
@@ -499,12 +595,29 @@ export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{
       history || '（无）',
       '',
       `请产出 ${count} 个新选题。`,
+      '必须输出 JSON：{"topics":[{"title":"选题标题","angle":"切入角度","brief":"内容要求"}]}',
     ].join('\n'),
     temperature: 0.9,
     maxTokens: 8_192,
   });
 
-  const topics = Array.isArray(raw?.topics) ? raw.topics : [];
+  // ⚠️ 模型不保证守 schema。这里必须**多形状容错**，而不是 `raw.topics`
+  // 取不到就静默返回空数组 —— 那会让 ideate 任务「成功」但一条选题都没插入，
+  // 定时创作于是每天空转，而界面上什么都看不出来（实测 2026-10-19：
+  // MiniMax 返回的是中文键 `选题`，不是约定的 `topics`）。
+  const topics = extractTopics(raw);
+
+  if (topics.length === 0) {
+    const keys = raw && typeof raw === 'object' ? Object.keys(raw).slice(0, 8).join(',') : typeof raw;
+    throw new Error(
+      `选题生成失败：模型返回里没有可用的选题数组（顶层键：${keys}）。` +
+        '这是解析问题而不是模型没产出，需要扩展 extractTopics 的容错形状。',
+    );
+  }
+  if (topics.length < count) {
+    logger.warn({ want: count, got: topics.length }, '选题产出少于请求数量');
+  }
+
   const inserted: Array<{ title: string; angle: string; brief: string }> = [];
 
   for (const t of topics.slice(0, count)) {
