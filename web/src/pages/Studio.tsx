@@ -98,6 +98,30 @@ export function Studio() {
     return () => clearInterval(t);
   }, [load]);
 
+  /**
+   * 只保存指定字段（其余字段用当前 draft 值补齐）。
+   * 给「点击即生效」的开关用 —— 开关不该依赖用户去找保存按钮。
+   */
+  async function saveNow(partial?: { autoCompose?: boolean; autoIdeate?: boolean }) {
+    setBusy('settings');
+    try {
+      await api.post('/api/settings', {
+        brand: draftBrand.value,
+        scheduleGenerate: partsToCron(draftParts.value),
+        autoCompose: partial?.autoCompose ?? draftAutoCompose.value,
+        autoIdeate: partial?.autoIdeate ?? draftAutoIdeate.value,
+        composePerRun: draftPerRun.value,
+        ideatePerRun: draftIdeateCount.value,
+      });
+      return true;
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), 'err');
+      return false;
+    } finally {
+      setBusy('');
+    }
+  }
+
   async function saveSettings() {
     setBusy('settings');
     try {
@@ -241,9 +265,27 @@ export function Studio() {
           </div>
           <button
             className={draftAutoCompose.value ? 'btn-primary' : 'btn-ghost'}
-            onClick={() => draftAutoCompose.onChange(!draftAutoCompose.value)}
+            disabled={busy === 'settings'}
+            onClick={() => {
+              // ⚠️ 开关**点击即保存**，不等「保存定时设置」。
+              // 之前只改本地状态：用户点完看到「已关闭」，以为生效了，
+              // 实际上保存请求从未发出 —— 刷新又变回「已开启」
+              //（实测 2026-10-20：数据库里 auto_compose 一直是 true）。
+              // 立即落库 + 乐观更新，失败回滚并提示。
+              const next = !draftAutoCompose.value;
+              draftAutoCompose.onChange(next);
+              void (async () => {
+                const ok = await saveNow({ autoCompose: next });
+                if (ok) {
+                  draftAutoCompose.commit();
+                  toast(next ? '定时创作已开启' : '定时创作已关闭');
+                } else {
+                  draftAutoCompose.onChange(!next); // 失败回滚
+                }
+              })();
+            }}
           >
-            {draftAutoCompose.value ? '已开启' : '已关闭'}
+            {busy === 'settings' ? '保存中…' : draftAutoCompose.value ? '已开启' : '已关闭'}
           </button>
         </div>
 
@@ -344,7 +386,21 @@ export function Studio() {
               />
               <button
                 className={draftAutoIdeate.value ? 'btn-primary' : 'btn-ghost'}
-                onClick={() => draftAutoIdeate.onChange(!draftAutoIdeate.value)}
+                disabled={busy === 'settings'}
+                onClick={() => {
+                  // 同主开关：点击即保存，失败回滚（不依赖保存按钮）
+                  const next = !draftAutoIdeate.value;
+                  draftAutoIdeate.onChange(next);
+                  void (async () => {
+                    const ok = await saveNow({ autoIdeate: next });
+                    if (ok) {
+                      draftAutoIdeate.commit();
+                      toast(next ? '自动补选题已开启' : '自动补选题已关闭');
+                    } else {
+                      draftAutoIdeate.onChange(!next);
+                    }
+                  })();
+                }}
               >
                 {draftAutoIdeate.value ? '自动补选题：开' : '自动补选题：关'}
               </button>
