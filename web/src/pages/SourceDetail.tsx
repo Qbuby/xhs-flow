@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { api, type NoteRow, type Topic, mediaUrl, fmtDate, fmtNum, exportCorpus } from '../api';
 import { Card, SectionTitle, StatusBadge, Spinner, Empty, Stat } from '../components';
-import { toast } from '../store';
+import { toast, useUi } from '../store';
 import { partsToCron, describeNext } from '../util/schedule';
 import { useDraftValue } from '../useDraftValue';
 
@@ -235,6 +235,8 @@ export function SourceDetail() {
   const [reCron, setReCron] = useState('04:00');
   const [reFreq, setReFreq] = useState<'daily' | 'weekly' | 'hourly'>('daily');
   const [reDays, setReDays] = useState<number[]>([1, 2, 3, 4, 5, 6, 7]);
+  // 记住最近看的语料源：侧栏的「模板调整」顶层入口靠它决定指向哪个源
+  const rememberSource = useUi((s) => s.rememberSource);
 
   async function load() {
     if (!id) return;
@@ -257,6 +259,10 @@ export function SourceDetail() {
     const t = setInterval(load, 12000);
     return () => clearInterval(t);
   }, [id]);
+
+  useEffect(() => {
+    if (id) rememberSource(Number(id));
+  }, [id, rememberSource]);
 
   /** 续抓：只补没有的，已入库自动跳过 */
   async function rescrape() {
@@ -390,6 +396,13 @@ export function SourceDetail() {
             >
               {busy === 'distill' ? '提交中…' : '蒸馏语料'}
             </button>
+            <Link
+              to={`/sources/${id}/brand-kit`}
+              className="btn-ghost"
+              title="模板调整：换 logo、品牌署名、副行文案与强调色"
+            >
+              模板调整
+            </Link>
             <button
               className="btn-primary"
               disabled={busy === 'scrape' || running === 'scrape'}

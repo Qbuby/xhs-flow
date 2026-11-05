@@ -1,7 +1,7 @@
 import type { Page } from 'playwright';
 import sharp from 'sharp';
 import { browser } from '../xhs/browser.js';
-import { MEDIA_DIR } from '../config.js';
+import { MEDIA_DIR, DATA_DIR } from '../config.js';
 import { getStyleProfile } from '../corpus/profile.js';
 import { stripEmoji } from '../util/text.js';
 import { logger } from '../logger.js';
@@ -9,7 +9,6 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { searchStock, toSearchHint } from '../media/stock.js';
 import type { StockImage } from '../media/stock.js';
 import { escapeHtml, highlightHtml } from './card-text.js';
 import {
@@ -26,12 +25,17 @@ import {
 } from './design/index.js';
 import { layoutBody, motifZone } from './layouts.js';
 import {
+  AccountTemplateSchema,
   DEFAULT_ACCOUNT_TEMPLATE,
   FAMILY_NUMBERING,
   FOOTER_BAR_HEIGHT,
   HEADER_BAR_HEIGHT,
   type AccountTemplate,
+  type TemplateFamilyId,
 } from './design/contract.js';
+import { brandKitAssetDataUriSync } from '../visual/templates/brand-kit-assets.js';
+import { getBrandKit, overlayBrandKit } from '../visual/templates/brand-kit-store.js';
+import { isBrandKitActive } from '../visual/templates/brand-kit.js';
 
 /**
  * 卡片渲染器。
@@ -81,9 +85,15 @@ export interface CardContent {
   layout: Layout;
   /** 版式相关的文案块，字段由各版式自行解释 */
   blocks: Record<string, unknown>;
-  /** photo_text 用的检索关键词（渲染时去图库取图） */
+  /**
+   * @deprecated 不再用于取图。
+   *
+   * 旧实现拿它去免费图库搜图，结果是「与内容无关的图库照」。
+   * 现在配图只有一个来源：语料案例图（按内容相关度从 corpus_photos 里挑）。
+   * 字段保留只为读旧数据不报错。
+   */
   photoQuery?: string;
-  /** 已下载好的底图（本地绝对路径），有则优先用它 */
+  /** 本地底图绝对路径（语料案例图）。有则用它。 */
   photoPath?: string;
 }
 
@@ -98,6 +108,28 @@ export interface Card {
    * 不再恒为 '01'。调用方不给时按 0 处理。
    */
   index?: number;
+  /**
+   * **本张卡片的模板族**（覆盖 spec 里的账号级族）。
+   *
+   * 【为什么需要逐页覆盖】
+   *
+   * 语料实测：118 篇语料的**封面**全是 ip-trend 形态，但**内页**分属五个族
+   * （brand-case 174 页 / title-top 163 / ip-trend 89 / label-dark 59 /
+   * blue-tag 46），而且**同一篇之内内页族也会切换**
+   * （386 = title-top×7 + brand-case + title-top）。
+   *
+   * 之前整篇共用一个族，于是每篇草稿的每一页都长得一样 —— 这就是
+   * 「每篇都很雷同」在视觉上的直接成因。逐页带族才能还原这个结构。
+   */
+  family?: TemplateFamilyId;
+  /**
+   * 本页的编号前缀（栏目英文关键词，如 SHIFT / STEP）。
+   *
+   * 语料实测：各篇的编号前缀不同（SHIFT / TRANSLATE / STEP / LAYER /
+   * CASE / PART / METHOD），都是**本篇主题的英文词**。只有细字编号族
+   * （wow-brand-case-v1）会用到；其它族的编号是纯数字。
+   */
+  numberingPrefix?: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -120,11 +152,32 @@ export const DEFAULT_RESOLVED: ResolvedSpec = resolveSpec(DEFAULT_CONTRACT);
  * 三种输入都能吃：新契约、旧画像、什么都没有。**永不抛** ——
  * 上游可能拿到坏 JSON 或缺字段的对象，渲染一张图不该因此失败。
  */
+/**
+ * 某来源的完整渲染规格 = 模板族（版式）+ 品牌套件（身份）。
+ *
+ * 【为什么叠加放在这里，而不是让调用方各拼一次】
+ * 生产渲染（renderCards）与预览渲染（模板调整页）必须走同一条路 ——
+ * 预览走另一条是经典坑：预览对了、生产不对。这里的 overlay 是唯一入口。
+ *
+ * 套件字段为空时保持模板原值，所以对没配置套件的账号完全没有影响。
+ */
 export function specForSource(sourceId: number | null): ResolvedSpec {
   if (!sourceId) return DEFAULT_RESOLVED;
   try {
     const found = getStyleProfile(sourceId);
-    return toResolved(found?.profile.card_template_spec);
+    const base = toResolved(found?.profile.card_template_spec);
+    const kit = getBrandKit(sourceId);
+
+    // 套件什么都没配：原样返回，零开销
+    if (!isBrandKitActive(kit)) return base;
+
+    const overlaid = overlayBrandKit(base.accountTemplate, kit);
+    // 走 schema 收敛，避免套件里的脏值直接进渲染
+    const parsed = AccountTemplateSchema.safeParse(overlaid);
+    return {
+      ...base,
+      accountTemplate: parsed.success ? parsed.data : base.accountTemplate,
+    };
   } catch (err) {
     logger.warn({ err, sourceId }, '读取风格规格失败，用默认规格');
     return DEFAULT_RESOLVED;
@@ -373,11 +426,11 @@ function brandAssetDataUri(relPath: string): string | null {
   if (brandAssetCache.has(relPath)) return brandAssetCache.get(relPath)!;
   let uri: string | null = null;
   try {
-    // relPath 形如 assets/brand/wow-logo-ink.png（coerceAccountTemplate 已校验格式）。
-    // 从本文件位置反推仓库根：编译后是 dist/generate/cards.js，向上三级是仓库根。
-    // 不能用 process.cwd()：服务可能从仓库根或 server/ 两种目录启动。
-    // file: URL 必须经 fileURLToPath —— Windows 下 pathname 是 /D:/...，直接
-    // path.resolve 会得到 D:\D:\...（实测踩过）。
+    // 两种来源：
+    //  1) 仓库内置资产 `assets/brand/xxx.png`（模板族自带的 WOW logo）
+    //  2) 用户上传的品牌套件 `kit:logo-dark-123.png`（模板调整功能）
+    // 第 2 种的物理位置在 data/brand-kits/<sourceId>/，不在仓库内，
+    // 所以需要 sourceId —— 由调用方通过 relPath 前缀外的参数传入。
     const here = path.dirname(fileURLToPath(import.meta.url));
     const repoRoot = path.resolve(here, '..', '..', '..');
     const abs = path.join(repoRoot, 'server', relPath);
@@ -388,6 +441,50 @@ function brandAssetDataUri(relPath: string): string | null {
   }
   brandAssetCache.set(relPath, uri);
   return uri;
+}
+
+/**
+ * 解析 logo 资产为 data URI，同时支持内置资产与品牌套件上传素材。
+ *
+ * `kit:` 前缀的路径由 brand-kit-store 的 overlayBrandKit 写入，
+ * 形如 `kit:logo-dark-1730000000.png`；真实位置是 data/brand-kits/<sourceId>/。
+ */
+/**
+ * 套件 logo 的宽高比（width/height）。
+ *
+ * 渲染器是同步的，但读 PNG 头部要 IO —— 所以用 sharp 异步读一次后就缓存。
+ * 读不到时退回 1（近方形），这是内置 WOW logo 的形状，最坏情况只是尺寸略偏。
+ */
+const logoRatioCache = new Map<string, number>();
+
+function brandKitLogoAspect(file: string, sourceId: number | null): number {
+  if (!sourceId) return 1;
+  const key = `${sourceId}:${file}`;
+  const hit = logoRatioCache.get(key);
+  if (hit !== undefined) return hit;
+
+  // 同步读 PNG IHDR：宽高在第 16..24 字节（大端）
+  try {
+    if (!/^[\w\-./]+\.png$/i.test(file) || file.includes('..')) return 1;
+    const abs = path.join(DATA_DIR, 'brand-kits', String(sourceId), file);
+    const buf = fsSync.readFileSync(abs);
+    if (buf.length < 24 || buf.toString('ascii', 1, 4) !== 'PNG') return 1;
+    const w = buf.readUInt32BE(16);
+    const h = buf.readUInt32BE(20);
+    const ratio = h > 0 ? w / h : 1;
+    logoRatioCache.set(key, ratio);
+    return ratio;
+  } catch {
+    return 1;
+  }
+}
+
+function resolveLogoDataUri(asset: string, sourceId: number | null): string | null {
+  if (asset.startsWith('kit:')) {
+    if (!sourceId) return null;
+    return brandKitAssetDataUriSync(sourceId, asset.slice(4));
+  }
+  return brandAssetDataUri(asset);
 }
 
 /**
@@ -405,6 +502,7 @@ function brandAssetDataUri(relPath: string): string | null {
 function accountChrome(
   template: AccountTemplate,
   cover: boolean,
+  sourceId: number | null = null,
 ): { html: string; barHeight: number } {
   const headerH = template.header_bar_height ?? HEADER_BAR_HEIGHT;
   const footerH = template.footer_bar_height ?? FOOTER_BAR_HEIGHT;
@@ -425,11 +523,37 @@ function accountChrome(
   // 但验收脚本会区分 logo_asset / logo_textual 两种保真等级。
   const dark = isDark(bg);
   const asset = dark ? template.logo_asset_light : template.logo_asset_dark;
-  const safeAsset = asset && /^assets\/[\w\-./]+\.png$/.test(asset) ? asset : null;
-  const dataUri = safeAsset ? brandAssetDataUri(safeAsset) : null;
+  // 两种合法来源：内置资产 assets/**.png，或品牌套件上传素材 kit:*.png
+  const safeAsset =
+    asset && (/^assets\/[\w\-./]+\.png$/.test(asset) || /^kit:[\w\-./]+\.png$/.test(asset))
+      ? asset
+      : null;
+  const dataUri = safeAsset ? resolveLogoDataUri(safeAsset, sourceId) : null;
+
+  /**
+   * Logo 显示尺寸。
+   *
+   * 内置资产是 WOW 那种近方形图标，固定 54px 高即可。
+   * 品牌套件上传的素材宽高比不定（Chengwang 是约 2:1 的横图），
+   * 固定高度会让它在横向上撑得过宽、撞到右侧文字 —— 所以按
+   * 原图宽高比算，并把**最大宽度**限制在条带可用空间内。
+   */
+  let logoSizing = 'height:54px;width:auto';
+  if (safeAsset?.startsWith('kit:')) {
+    const ratio = brandKitLogoAspect(safeAsset.slice(4), sourceId);
+    const boxH = 56;
+    const boxW = Math.round(boxH * ratio);
+    // 可用宽度：条带宽度 - 左右 padding - 右侧文字占位（约 520px）
+    const maxW = 300;
+    logoSizing =
+      boxW > maxW
+        ? `height:${Math.round((maxW / ratio) * 10) / 10}px;width:${maxW}px;object-fit:contain;object-position:left center`
+        : `height:${boxH}px;width:${boxW}px;object-fit:contain;object-position:left center`;
+  }
+
   const logoHtml = dataUri
     ? `<img src="${dataUri}" alt="${esc(logo)}" data-smoke-logo
-         style="height:54px;width:auto;display:block" />`
+         style="${logoSizing};display:block" />`
     : logo
       ? `<span style="font-size:44px;font-weight:800;letter-spacing:.02em;line-height:1">${esc(logo)}</span>`
       : '<span></span>';
@@ -515,8 +639,37 @@ export function buildCardHtml(
   card: Card,
   spec: ResolvedSpec,
   photoDataUri?: string,
+  /**
+   * 来源 id。品牌套件上传的 logo 存在 data/brand-kits/<sourceId>/，
+   * 渲染器需要它才能取到素材。不传时套件 logo 会回落成文字 logo。
+   */
+  sourceId: number | null = null,
 ): string {
-  const dark = isDark(spec.palette.bg);
+  /**
+   * 逐页模板族覆盖。
+   *
+   * `spec.accountTemplate.family` 是**账号级**的（整篇共用），而语料里
+   * 同一篇之内的内页族是会切换的。所以这一页要用哪个族，由 card.family 决定。
+   *
+   * 覆盖只动 `family` 这一个字段 —— 编号形态（familyNumbering）、标题起排
+   * y（familyTop）都是按族查表得到的，换了族自然就换形态，几何与配色不变。
+   */
+  const pageSpec: ResolvedSpec = card.family
+    ? {
+        ...spec,
+        accountTemplate: {
+          ...spec.accountTemplate,
+          family: card.family,
+          // 前缀也跟着这一页走：brand-case 页要显示 `SHIFT · 01`，
+          // ip-trend 页是纯数字，混用就会两边都不对。
+          ...(card.numberingPrefix
+            ? { numbering_prefix: card.numberingPrefix }
+            : { numbering_prefix: undefined }),
+        },
+      }
+    : spec;
+
+  const dark = isDark(pageSpec.palette.bg);
   const b = card.blocks;
 
   // 编号语义与原账号一致（339/0=无编号、339/1=01、339/2=02，实测）：
@@ -526,10 +679,10 @@ export function buildCardHtml(
   const pageNo = modelWatermark || (card.layout === 'cover' ? '' : badgeText(Math.max(0, idx - 1)));
 
   const motifCtx: MotifContext = {
-    palette: spec.palette,
+    palette: pageSpec.palette,
     dark,
     fontMono: `ui-monospace, Consolas, "Cascadia Mono", monospace`,
-    fontBody: spec.fontBody,
+    fontBody: pageSpec.fontBody,
     pageNo,
     tag: typeof b.eyebrow === 'string' ? b.eyebrow : undefined,
   };
@@ -538,21 +691,21 @@ export function buildCardHtml(
   // 所以内容层可以自由改版式而不用管它们。
   // 复刻模式（有账号模板）关闭纹理与通用装饰：原账号内页没有噪点/网格，
   // 半透明纹理层会扰动像素验收（页脚条中位色、编号混色都被它移动）。
-  const templateActive = !!(spec.accountTemplate.cover_header_text || spec.accountTemplate.inner_footer_text);
+  const templateActive = !!(pageSpec.accountTemplate.cover_header_text || pageSpec.accountTemplate.inner_footer_text);
   const texture = templateActive
     ? ''
     : textureLayer({
-        texture: spec.texture,
-        bg: spec.palette.bg,
-        accent: spec.palette.accent,
-        tint: spec.palette.tint,
+        texture: pageSpec.texture,
+        bg: pageSpec.palette.bg,
+        accent: pageSpec.palette.accent,
+        tint: pageSpec.palette.tint,
         dark,
         zIndex: 1,
       });
 
   const content = layoutBody(card.layout, {
     blocks: b,
-    spec,
+    spec: pageSpec,
     photoDataUri,
     pageNo,
     motifCtx,
@@ -561,19 +714,19 @@ export function buildCardHtml(
   // 图卡自己铺底图，纹理层要压在底图之上、内容之下
   const isPhoto = card.layout === 'photo_text' && Boolean(photoDataUri);
 
-  const template = spec.accountTemplate.cover_header_text || spec.accountTemplate.inner_footer_text
-    ? spec.accountTemplate
-    : (spec.contract.account_template ?? DEFAULT_ACCOUNT_TEMPLATE);
+  const template = pageSpec.accountTemplate.cover_header_text || pageSpec.accountTemplate.inner_footer_text
+    ? pageSpec.accountTemplate
+    : (pageSpec.contract.account_template ?? DEFAULT_ACCOUNT_TEMPLATE);
   // 有封面页眉条时，内容整体下移让出**整条高度**——之前 dense 档 paddingY=76
   // 小于条高 128，标题/装饰会顶进页眉条里；现在条高优先再加 24px 呼吸。
   // 内页同理让出页脚条：内容可用高度 = 画布 - 条高，而不是让绝对定位的
   // 条盖在内容上装作看不见。
-  const chrome = accountChrome(template, card.layout === 'cover');
+  const chrome = accountChrome(template, card.layout === 'cover', sourceId);
   const coverBarH = template.cover_header_text ? chrome.barHeight : 0;
   const footerBarH = !isCoverPage(card.layout) && template.inner_footer_text ? template.footer_bar_height ?? FOOTER_BAR_HEIGHT : 0;
   const topPad = coverBarH > 0
-    ? Math.max(spec.density.paddingY, coverBarH + 24)
-    : spec.density.paddingY;
+    ? Math.max(pageSpec.density.paddingY, coverBarH + 24)
+    : pageSpec.density.paddingY;
   const chromeCss = `<style>.card{
     padding-top:${topPad}px !important;
     ${footerBarH > 0 ? `padding-bottom:${footerBarH + 28}px !important;` : ''}
@@ -581,17 +734,17 @@ export function buildCardHtml(
   /* 内容层的坐标原点 = .card 的 padding box 内沿 = 画布原点 + 顶部 padding。
      复刻版式要按**画布坐标**落位（标题 y=266 是原图实测），所以把
      注入的顶部 padding 暴露成变量，布局层用 calc 抵扣，不靠硬编码密度值。 */
-  :root{--pad-top:${topPad}px;--pad-x:${spec.density.paddingX}px}
+  :root{--pad-top:${topPad}px;--pad-x:${pageSpec.density.paddingX}px}
   </style>`;
 
   // 编号在 chrome 层画（画布坐标，见 accountPageNumber 注释）
-  const pageNoHtml = accountPageNumber(spec, pageNo, isCoverPage(card.layout));
+  const pageNoHtml = accountPageNumber(pageSpec, pageNo, isCoverPage(card.layout));
 
   return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">${chromeCss}<style>${baseCss(spec, { photoDataUri: isPhoto ? photoDataUri : undefined })}</style></head>
+<html lang="zh-CN"><head><meta charset="utf-8">${chromeCss}<style>${baseCss(pageSpec, { photoDataUri: isPhoto ? photoDataUri : undefined })}</style></head>
 <body><div class="card">
   ${texture}
-  ${motifLayer(spec.motifs, motifCtx, motifZone(card.layout))}
+  ${motifLayer(pageSpec.motifs, motifCtx, motifZone(card.layout))}
   <div style="position:relative;z-index:2;height:100%">${content}</div>
   ${pageNoHtml}
   ${chrome.html}
@@ -640,7 +793,20 @@ export interface RenderOptions {
   allowStock?: boolean;
 }
 
-/** 为 photo_text 取底图并归一化，失败返回 undefined（退化成暗底大字）。 */
+/**
+ * 为 photo_text 取底图并归一化，失败返回 undefined（退化成纯文字卡）。
+ *
+ * 【不再走免费图库】
+ *
+ * 旧实现在这里调 `searchStock()`：模型写一个中文检索词 → `media/hints.ts`
+ * 映射成英文 → Pexels/Pixabay/Unsplash/Wikimedia 找图。那条路出来的图
+ * 必然是「通用图库照」：中文检索词映射后落到极泛的英文词上（"品牌手册 白底 桌面"
+ * → "white desk notebook"），与论点无关，也与这个账号的视觉语言不符
+ * （语料 736 页里内页 546 页只有 12 页有大面积实拍，其余是排版卡片）。
+ *
+ * 现在底图只有一个来源：**语料案例图**（由 pipeline 在创作时按内容匹配好，
+ * 放进 `blocks.photoPath`）。所以这里不再联网找图。
+ */
 async function resolvePhoto(
   card: Card,
   opts: RenderOptions,
@@ -648,29 +814,25 @@ async function resolvePhoto(
 ): Promise<string | undefined> {
   if (card.layout !== 'photo_text') return undefined;
 
-  // 1. 本地已有图
+  // 本地已有图（语料案例图，或调用方指定的路径）
   if (card.blocks.photoPath) {
     const uri = await toDataUri(String(card.blocks.photoPath));
     if (uri) return uri;
   }
 
-  // 2. 指定 URL / 3. 去图库搜
-  const query = String(card.blocks.photoQuery ?? '');
-  let picked: StockImage | undefined;
-  if (card.photoUrl) {
-    picked = {
-      url: String(card.photoUrl),
-      thumbUrl: '',
-      width: CARD_WIDTH,
-      height: CARD_HEIGHT,
-      author: '',
-      sourceProvider: 'preset',
-      sourceUrl: '',
-      license: '',
-    };
-  } else if (opts.allowStock !== false) {
-    picked = (await searchStock(toSearchHint(query), 1))[0];
-  }
+  // 显式指定的 URL（调用方自己给的外链）仍然支持
+  const picked: StockImage | undefined = card.photoUrl
+    ? {
+        url: String(card.photoUrl),
+        thumbUrl: '',
+        width: CARD_WIDTH,
+        height: CARD_HEIGHT,
+        author: '',
+        sourceProvider: 'preset',
+        sourceUrl: '',
+        license: '',
+      }
+    : undefined;
   if (!picked) return undefined;
 
   await fs.mkdir(opts.outputDir, { recursive: true });
@@ -693,7 +855,7 @@ async function resolvePhoto(
     await fs.unlink(tmp).catch(() => undefined);
     return uri;
   } catch (err) {
-    logger.warn({ err, query, url: picked.url }, '配图下载失败，退回纯文字排版');
+    logger.warn({ err, url: picked.url }, '配图下载失败，退回纯文字排版');
     return undefined;
   }
 }
@@ -703,7 +865,15 @@ export async function renderCard(card: Card, opts: RenderOptions): Promise<strin
   const page = await getRenderPage();
   const photoUri = await resolvePhoto(card, opts, spec);
 
-  const html = buildCardHtml(card, spec, photoUri);
+  /**
+   * ⚠️ 必须把 sourceId 传下去。
+   *
+   * 品牌套件上传的 logo 存在 data/brand-kits/<sourceId>/，`accountChrome`
+   * 要靠 sourceId 才能拼出路径。这里漏传的话，套件里的 `kit:*.png`
+   * 会被当成读不到的资产，静默回落到文字 logo ——
+   * 表现就是「模板调整页预览正常（那里传了 sourceId），但生产的图还是旧 logo」。
+   */
+  const html = buildCardHtml(card, spec, photoUri, opts.sourceId);
   await page.setContent(html, { waitUntil: 'load' });
   await page.evaluate(() => (document as Document & { fonts?: { ready: Promise<void> } }).fonts?.ready);
   // 等一帧，让噪点/混合模式这些合成层稳定下来再截图

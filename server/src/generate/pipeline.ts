@@ -7,9 +7,21 @@ import { logger } from '../logger.js';
 import { MEDIA_DIR } from '../config.js';
 import { renderCards, toResolved, CARD_WIDTH, type Card, type Layout, LAYOUTS } from './cards.js';
 import { maxTitleLines, type ResolvedSpec } from './design/index.js';
+import {
+  buildDeckPlan,
+  planSummary,
+  prefixFromPlan,
+  type DeckPlan,
+} from './design/plan.js';
+import {
+  corpusPhotoPool,
+  pickCorpusPhoto,
+} from '../visual/templates/corpus-photo-match.js';
 import { stripEmoji } from '../util/text.js';
+import { titleSimilarity, TITLE_NEAR_DUP_THRESHOLD } from '../util/text-sim.js';
 import { productionGate } from '../visual/templates/registry.js';
 import { EXTRACTOR_VERSION } from '../visual/evidence/extract.js';
+import type { TemplateFamilyId } from './design/contract.js';
 import path from 'node:path';
 
 /* ------------------------------------------------------------------ */
@@ -19,7 +31,6 @@ import path from 'node:path';
 const CardSchema = z.object({
   layout: z.enum(LAYOUTS),
   blocks: z.record(z.any()),
-  photoQuery: z.string().optional().describe('photo_text 版式用的配图检索词，中文即可'),
 });
 
 const DraftSchema = z.object({
@@ -200,7 +211,7 @@ const DRAFT_TEMPLATE = `{
     { "layout": "list", "blocks": { "eyebrow": "重点", "title": "标题", "items": [{ "text": "要点", "note": "补充" }] } },
     { "layout": "steps", "blocks": { "eyebrow": "怎么做", "title": "标题", "items": [{ "text": "步骤", "note": "说明" }] } },
     { "layout": "compare", "blocks": { "eyebrow": "对比", "title": "标题", "left": { "title": "A", "items": ["…"] }, "right": { "title": "B", "items": ["…"] }, "conclusion": "结论" } },
-    { "layout": "photo_text", "blocks": { "title": "标题", "subtitle": "副标题", "photoQuery": "配图检索词" } },
+    { "layout": "photo_text", "blocks": { "title": "标题", "subtitle": "副标题" } },
     { "layout": "cta", "blocks": { "title": "标题", "action": "引导语" } }
   ]
 }`;
@@ -212,6 +223,63 @@ export interface ComposeResult {
   rendered: number;
 }
 
+/**
+ * 按计划生成 JSON 骨架模板。
+ *
+ * 旧实现是一份写死的 7 卡模板（cover/quote/list/steps/compare/photo_text/cta），
+ * 所以每篇都长一个样。这里改成**按语料派生的计划**生成：
+ * 页数、骨架节拍、每张的版式都来自语料样稿。
+ */
+function planTemplate(plan: DeckPlan): string {
+  const slots = plan.roles.map((role, i) => {
+    const beat = plan.slotBeats[i] ?? '';
+    switch (role) {
+      case 'cover':
+        return `    { "layout": "cover", "blocks": { "eyebrow": "短标签", "title": "主标题，用 [[强调]]", "items": ["短句1", "短句2"], "hint": "引导语" } }`;
+      case 'quote':
+        return `    { "layout": "quote", "blocks": { "text": "金句", "note": "补充解释", "attribution": "出处或\\"我\\"" } }`;
+      case 'list':
+        return `    { "layout": "list", "blocks": { "eyebrow": "重点", "title": "标题", "items": [{ "text": "要点", "note": "补充" }] } }`;
+      case 'steps':
+        return `    { "layout": "steps", "blocks": { "eyebrow": "怎么做", "title": "标题", "items": [{ "text": "步骤", "note": "说明" }] } }`;
+      case 'compare':
+        return `    { "layout": "compare", "blocks": { "eyebrow": "对比", "title": "标题", "left": { "title": "A", "items": ["…"] }, "right": { "title": "B", "items": ["…"] }, "conclusion": "结论" } }`;
+      case 'photo_text':
+        return `    { "layout": "photo_text", "blocks": { "title": "标题", "subtitle": "副标题" } }`;
+      default:
+        return `    { "layout": "cta", "blocks": { "title": "标题", "action": "引导语" } }`;
+    }
+  });
+  return `{
+  "title": "20 字以内的标题",
+  "body": "第一段…\\n\\n第二段…\\n\\n第三段…（段间必须有空行，不要挤成一整块）",
+  "tags": ["话题1", "话题2"],
+  "cards": [
+${slots.join(',\n')}
+  ]
+}`;
+}
+
+/** 每张卡片这一拍要讲什么（喂给模型，避免它自由发挥成同一套结构）。 */
+function planBeatsBlock(plan: DeckPlan): string {
+  const lines = plan.roles.map((role, i) => {
+    const beat = plan.slotBeats[i] || '';
+    const label = BEAT_LABEL[role] ?? role;
+    return `  第 ${i + 1} 张（${label}）：讲「${beat}」`;
+  });
+  return ['【本篇的逐页分工 —— 每张卡讲一件事，严格按这个顺序】', ...lines].join('\n');
+}
+
+const BEAT_LABEL: Record<string, string> = {
+  cover: '封面',
+  quote: '金句',
+  list: '清单',
+  steps: '步骤',
+  compare: '对比',
+  photo_text: '案例配图',
+  cta: '收尾',
+};
+
 export async function composeDraft(opts: {
   sourceId: number;
   topic: string;
@@ -220,20 +288,40 @@ export async function composeDraft(opts: {
   brand?: string;
   cardCount?: number;
 }): Promise<ComposeResult> {
-  const { sourceId, topic, angle, brief, brand = '', cardCount = 7 } = opts;
+  const { sourceId, topic, angle, brief, brand = '' } = opts;
 
   const profile = getStyleProfile(sourceId)?.profile ?? null;
   const examples = retrieveWithFallback(`${topic} ${angle ?? ''}`, sourceId, 4);
+
+  /**
+   * 施工计划：页数 + 骨架 + 逐页版式 + 逐页模板族，全部取自语料。
+   *
+   * 没有计划（语料还没蒸馏）时退回固定 7 卡 —— 但那种情况下本来也
+   * 复刻不了模板，渲染阶段会被生产闸门拦住。
+   */
+  const plan = buildDeckPlan(
+    sourceId,
+    topic,
+    examples.map((e) => e.notePk),
+  );
+
+  const cardCount = plan?.cardCount ?? opts.cardCount ?? 7;
 
   const user = [
     `【本次选题】${topic}`,
     angle ? `【切入角度】${angle}` : '',
     brief ? `【补充要求】${brief}` : '',
     brand ? `【品牌署名】页脚署名用「${brand}」` : '',
-    `【卡片数量】${cardCount} 张，第 1 张必须 layout="cover" 作为封面，最后一张建议 layout="cta"。`,
+    `【卡片数量】${cardCount} 张，第 1 张必须是 layout="cover" 作为封面，最后一张是 layout="cta"。`,
     '',
     buildStyleBlock(profile),
     buildExamplesBlock(examples),
+    '',
+    plan ? planBeatsBlock(plan) : '',
+    plan
+      ? `【结构参考】这一篇的结构照语料《${plan.exemplarTitle}》来：` +
+        `正文骨架是「${plan.skeleton}」。每张卡讲一件事，不要把几件事塞进同一张。`
+      : '',
     '',
     '【每张卡片的内容要求】',
     '- cover：eyebrow(短标签)/title(主标题，用 [[强调]])/items(3-4 个短句)/hint(引导语)',
@@ -241,7 +329,7 @@ export async function composeDraft(opts: {
     '- list：title + items[{text, note}]，4-6 条',
     '- steps：title + items[{text, note}]，3-5 步',
     '- compare：title + left{title,items} + right{title,items} + conclusion',
-    '- photo_text：title + subtitle + photoQuery(配图检索词，如 "咖啡 桌面")',
+    '- photo_text：title + subtitle（配图由系统按内容匹配语料案例图，你不用给检索词）',
     '- cta：title + action(引导语)',
     '',
     '【文案品质要求 —— 每一条都要做到】',
@@ -249,11 +337,12 @@ export async function composeDraft(opts: {
     '- 全文（含卡片）**不要出现任何 emoji**',
     '- 不写"绝绝子/宝藏/yyds/赋能/抓手"这类词',
     '- 至少给出 2 个具体可验证的结论（数字、判断标准、取舍代价）',
+    '- **不要写"语言体系""视觉规范""方法论"这种抽象大词当标题** —— 标题要落到具体的东西上',
     '',
     '【最重要的要求】严格按下面这份 JSON 结构输出。',
     '每张卡片的文案字段必须**嵌套在 blocks 对象内**，不要平铺到卡片对象上。',
     '```json',
-    DRAFT_TEMPLATE,
+    plan ? planTemplate(plan) : DRAFT_TEMPLATE,
     '```',
     '',
     '现在输出 JSON。',
@@ -307,29 +396,41 @@ export async function composeDraft(opts: {
   }
   /* --- 落库 --- */
   const ins = run(
-    `INSERT INTO drafts(source_id, title, body, tags, status, ref_note_ids)
-     VALUES (?,?,?,?, 'pending', ?)`,
+    `INSERT INTO drafts(source_id, title, body, tags, status, ref_note_ids, plan)
+     VALUES (?,?,?,?, 'pending', ?, ?)`,
     sourceId,
     draft.title.slice(0, 40),
     draft.body,
     JSON.stringify(draft.tags),
     JSON.stringify(examples.map((e) => e.notePk)),
+    plan ? JSON.stringify(planSummary(plan)) : null,
   );
   const draftId = Number(ins.lastInsertRowid);
 
-  const cards: Card[] = draft.cards.slice(0, 10).map((c) => ({
+  /**
+   * 逐张卡片的模板族来自计划。
+   *
+   * 关键点：**版式（list/steps/compare）与模板族（wow-brand-case-v1 等）
+   * 是两个正交的维度**。版式决定「这页放什么内容」，模板族决定「这页长什么样」
+   * （编号形态、标题起排 y、页脚条）。之前整篇共用一个族，所以每篇都长得一样。
+   */
+  const cards: Card[] = draft.cards.slice(0, 10).map((c, i) => ({
     layout: c.layout,
     blocks: { ...c.blocks, brand },
+    family: plan?.families[i],
   }));
 
   cards.forEach((c, i) => {
     run(
-      'INSERT INTO draft_cards(draft_id, idx, layout, content, photo_url) VALUES (?,?,?,?,?)',
+      'INSERT INTO draft_cards(draft_id, idx, layout, content, photo_url, family) VALUES (?,?,?,?,?,?)',
       draftId,
       i,
       c.layout,
       JSON.stringify(c.blocks),
-      c.blocks.photoQuery ? String(c.blocks.photoQuery) : null,
+      // photo_url 现在存的是**语料案例图的绝对路径**（渲染时按内容匹配后回填），
+      // 不再是模型的检索词 —— 免费图库是「无关的免费图」问题的根源。
+      null,
+      c.family ?? null,
     );
   });
 
@@ -439,7 +540,7 @@ function coerceDraft(raw: unknown): Draft {
       if (Object.keys(flat).length > 0) blocks = flat;
     }
 
-    return { layout, blocks, photoQuery: c?.photoQuery as string | undefined };
+    return { layout, blocks };
   }) as Draft['cards'];
 
   // 封面必须有
@@ -467,11 +568,34 @@ function coerceDraft(raw: unknown): Draft {
  * 阻断不是失败回滚：草稿与文案照常留在库里，用户看得到内容，
  * 只是不会拿到「看起来没问题但其实不是那个模板」的图。
  */
+/**
+ * 渲染用的辅助：读某草稿落库的计划 JSON。
+ *
+ * 单独抽出来是因为 TS 的泛型内联写法 `get< plan: string | null }>(...)`
+ * 在 JSX/箭头混排的文件里容易被误解析 —— 用一个具名类型更稳。
+ */
+interface PlanRow {
+  plan: string | null;
+}
+
+function getPlanOf(draftId: number): string | null {
+  return get<PlanRow>('SELECT plan FROM drafts WHERE id = ?', draftId)?.plan ?? null;
+}
+
 export async function renderDraftCards(draftId: number, sourceId: number | null): Promise<number> {
-  const rows = all<{ id: number; layout: string; content: string; photo_url: string | null }>(
-    'SELECT id, layout, content, photo_url FROM draft_cards WHERE draft_id = ? ORDER BY idx',
+  const rows = all<{
+    id: number;
+    layout: string;
+    content: string;
+    photo_url: string | null;
+    family: string | null;
+  }>(
+    'SELECT id, layout, content, photo_url, family FROM draft_cards WHERE draft_id = ? ORDER BY idx',
     draftId,
   );
+
+  // 编号前缀存在草稿的计划里（创作时按语料样稿写入）
+  const planPrefix = prefixFromPlan(getPlanOf(draftId));
 
   const outputDir = path.join(MEDIA_DIR, 'drafts', String(draftId));
 
@@ -500,11 +624,45 @@ export async function renderDraftCards(draftId: number, sourceId: number | null)
     } catch {
       /* 内容坏了就渲染成空卡 */
     }
-    if (!blocks.photoQuery && r.photo_url) blocks.photoQuery = r.photo_url;
     // 卡片序号跟随落库的 idx：编号样式为 "01" 的账号模板渲染成 01/02/03…。
     // 之前渲染端拿不到顺序，页码兜底恒为 '01'。
-    return { layout: r.layout as Layout, blocks, index: i };
+    return {
+      layout: r.layout as Layout,
+      blocks,
+      index: i,
+      // 逐页模板族（创作时按语料样稿写死在这里）。
+      family: (r.family as TemplateFamilyId) ?? undefined,
+      // 编号前缀按计划来：只有细字编号族用得上
+      numberingPrefix: planPrefix || undefined,
+    };
   });
+
+  /**
+   * 配图：走**语料案例图池**，不走免费图库。
+   *
+   * 之前是让模型写中文检索词去 Pexels/Wikimedia 找图 —— 结果每篇都挂一张
+   * 「笔记本手写」「品牌手册白底」之类的通用图库照，与内容、与账号风格都对不上。
+   * 语料里的案例图才是这个账号该有的配图（喜茶、劲牌、三九胃泰……）。
+   *
+   * 挑图按「本卡内容 × 来源笔记标题/标签」的相关度算；没有明显相关的就不配图，
+   * 让这一格走纯文字版式 —— 语料里本来就有大量纯文字卡。
+   */
+  if (sourceId) {
+    const used: number[] = [];
+    for (const card of cards) {
+      if (card.layout !== 'photo_text') continue;
+      const text = [
+        String(card.blocks.title ?? ''),
+        String(card.blocks.subtitle ?? ''),
+        ...(Array.isArray(card.blocks.items) ? card.blocks.items.map((i) => String(i)) : []),
+      ].join(' ');
+      const file = pickCorpusPhoto(sourceId, text, used);
+      if (file) {
+        card.blocks.photoPath = file;
+        used.push(...corpusPhotoPool(sourceId).filter((p) => p.file === file).map((p) => p.id));
+      }
+    }
+  }
 
   const paths = await renderCards(cards, { sourceId, outputDir });
 
@@ -723,6 +881,28 @@ export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{
   );
   const OFF_TOPIC = /涨粉|流量增长|投放|私域|SEO|搜索排名|关键词布局|账号定位怎么做|短视频起号|直播话术|小红书运营技巧|如何引流/;
 
+  /**
+   * 近似重复检测。
+   *
+   * 之前只做**完全相同**的判重（existingTitles 是 Set），所以下面这些全都进来了：
+   *   - 「主理人IP和品牌IP先做哪个」/「主理人IP和品牌IP，先做哪个？」/「主理人IP和品牌IP先做哪个」
+   *     —— 三个标题只差标点
+   *   - 「为什么出圈的新品牌，都不太像品牌」/「为什么出圈的品牌，都不太像品牌了」
+   *     —— 二元组相似度 0.73
+   *
+   * 实测语料内部最高相似度只有 0.26，而成稿之间能到 0.73~1.00，
+   * 所以阈值取 **0.62** 落在两者之间，既拦得住改标点的重复，
+   * 又不会误杀语料里正常的不同命题。
+   *
+   * 比对范围不只语料，还有**近期成稿** —— 语料是别人写的，成稿是我们自己写的，
+   * 「我们连着写了三篇几乎一样的」才是最该被拦下的。
+   */
+  const recentDraftTitles = all<{ title: string }>(
+    'SELECT title FROM drafts WHERE source_id = ? ORDER BY id DESC LIMIT 40',
+    sourceId,
+  ).map((r) => r.title);
+  const nearTitles = [...existingTitles, ...recentDraftTitles];
+
   const accepted: Array<{ title: string; angle: string; brief: string }> = [];
   const rejected: Array<{ title: string; why: string }> = [];
 
@@ -740,6 +920,12 @@ export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{
     }
     if (existingTitles.has(title)) {
       rejected.push({ title, why: '与语料已有标题完全重复' });
+      continue;
+    }
+    // 与已接受过的选题之间也要查 —— 同一次生成里的两个近似题同样会变成两篇雷同稿
+    const near = nearTitles.find((other) => titleSimilarity(title, other) >= TITLE_NEAR_DUP_THRESHOLD);
+    if (near) {
+      rejected.push({ title, why: `与已有标题近似：「${near}」` });
       continue;
     }
     accepted.push({ ...t, title });

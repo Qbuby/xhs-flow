@@ -278,3 +278,105 @@ export function describeImport(s: CorpusImportSummary): string {
   if (s.imagesWithoutFile) parts.push(`缺图 ${s.imagesWithoutFile}`);
   return parts.join(' · ');
 }
+
+/* ----------------------------- 品牌套件（模板调整） ----------------------------- */
+
+/** 套件里的一项素材（logo 图形）。同一张原图派生深色/浅色两版。 */
+export interface BrandKitAsset {
+  /** 相对 data/brand-kits/ 的文件名 */
+  file: string;
+  /** 原始上传文件名，界面展示用 */
+  originalName?: string;
+  width: number;
+  height: number;
+  uploadedAt: string;
+  /** cutout = 抠成透明底；plain = 原样保留 */
+  mode: 'cutout' | 'plain';
+  cutoutThreshold?: number;
+}
+
+/** 品牌套件：账号视觉系统之上的身份覆盖层。字段可空 = 沿用模板族原值。 */
+export interface BrandKit {
+  sourceId: number;
+  brandName?: string;
+  brandTagline?: string;
+  logoDark?: BrandKitAsset;
+  logoLight?: BrandKitAsset;
+  accent?: string;
+  updatedAt: string;
+}
+
+/** 一条「原值 → 新值」。 */
+export interface BrandKitDiff {
+  field: 'brandName' | 'brandTagline' | 'logo' | 'accent';
+  label: string;
+  from: string;
+  to: string;
+}
+
+/** 模板族里实测出来的身份基线，用于展示「改之前是什么样」。 */
+export interface BrandKitBaseline {
+  brandName: string;
+  brandTagline: string;
+  accent: string;
+  hasLogo: boolean;
+  family: string;
+}
+
+/** GET /api/sources/:id/brand-kit */
+export interface BrandKitState {
+  sourceId: number;
+  kit: BrandKit;
+  /** 套件是否真的覆盖了什么（空套件不算启用） */
+  active: boolean;
+  overrideCount: number;
+  diff: BrandKitDiff[];
+  baseline: BrandKitBaseline;
+  /** 服务端给的说明：套件只改身份层，版式几何不动 */
+  note: string;
+}
+
+/** 自然语言解析出来的修正项。 */
+export interface BrandKitPatch {
+  brandName?: string;
+  brandTagline?: string;
+  accent?: string;
+  /** 用户提到了「用这张图」，需要前端上传后才生效 */
+  wantsLogoUpload?: boolean;
+  /** 用户要求还原的字段 */
+  clear?: Array<'brandName' | 'brandTagline' | 'logo' | 'accent'>;
+  /** 给用户看的解释 */
+  reply: string;
+}
+
+/** POST /api/sources/:id/brand-kit/chat 的返回（不落库，只是预览） */
+export interface BrandKitChatResult {
+  patch: BrandKitPatch;
+  /** 应用 patch 后的套件，仅用于界面预览 */
+  draftKit: BrandKit;
+  diff: BrandKitDiff[];
+  /** 需要用户上传素材才能完成的部分 */
+  needsUpload: boolean;
+}
+
+/** POST /api/sources/:id/brand-kit/apply */
+export interface BrandKitApplyResult {
+  ok: boolean;
+  kit: BrandKit;
+  active: boolean;
+  diff: BrandKitDiff[];
+}
+
+/** POST /api/sources/:id/brand-kit/logo */
+export interface BrandKitLogoResult {
+  ok: boolean;
+  kit: BrandKit;
+  prepared: { width: number; height: number; inkRatio: number };
+  diff: BrandKitDiff[];
+}
+
+/** POST /api/sources/:id/brand-kit/preview */
+export interface BrandKitPreviewResult {
+  ok: boolean;
+  files: Array<{ layout: string; url: string; width: number; height: number }>;
+}

@@ -160,6 +160,27 @@ export const MIGRATIONS: string[] = [
   );
   `,
 
+  /* ---------- 稿件计划与逐页模板族 ---------- */
+  `
+  CREATE TABLE IF NOT EXISTS draft_plans (
+    draft_id     INTEGER PRIMARY KEY REFERENCES drafts(id) ON DELETE CASCADE,
+    source_id    INTEGER NOT NULL,
+    exemplar_note_id INTEGER,           -- 参照的语料笔记
+    skeleton     TEXT,                   -- 正文骨架（语料原句）
+    beats        TEXT,                   -- JSON：节拍数组
+    roles        TEXT,                   -- JSON：每张卡片的版式
+    inner_family TEXT,                   -- 内页模板族
+    cover_family TEXT,                   -- 封面模板族
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  `,
+  `
+  ALTER TABLE draft_cards ADD COLUMN family TEXT;         -- 该页的模板族（逐页不同）
+  `,
+  `
+  ALTER TABLE drafts ADD COLUMN plan TEXT;                -- JSON：计划摘要（复现与去重用）
+  `,
+
   /* ---------- 任务队列 ---------- */
   `
   CREATE TABLE IF NOT EXISTS jobs (
@@ -241,6 +262,25 @@ export const MIGRATIONS: string[] = [
   );
   CREATE INDEX IF NOT EXISTS idx_page_evidence_source ON page_evidence(source_id, family);
   CREATE INDEX IF NOT EXISTS idx_page_evidence_note ON page_evidence(note_id, page_index);
+  `,
+
+  /* ---------- 语料配图池 ---------- */
+  `
+  CREATE TABLE IF NOT EXISTS corpus_photos (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id   INTEGER NOT NULL,
+    note_id     INTEGER NOT NULL,     -- 照片来自哪篇语料（= 题材线索）
+    page_index  INTEGER NOT NULL,     -- 该篇的第几页
+    file        TEXT NOT NULL,        -- 裁出来的图（绝对路径）
+    x           INTEGER NOT NULL,     -- 原图上的裁切框
+    y           INTEGER NOT NULL,
+    w           INTEGER NOT NULL,
+    h           INTEGER NOT NULL,
+    tiles       INTEGER NOT NULL,     -- 面积（检测格数），越大越像真照片
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(source_id, note_id, page_index, file)
+  );
+  CREATE INDEX IF NOT EXISTS idx_corpus_photos_source ON corpus_photos(source_id, note_id);
   `,
 
   /* ---------- 运行日志 ---------- */

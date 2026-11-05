@@ -31,6 +31,7 @@ import { getStyleProfile } from '../corpus/profile.js';
 import { composeDraft, ideateTopics, renderDraftCards } from '../generate/pipeline.js';
 import { renderCard, toResolved } from '../generate/cards.js';
 import { enqueue, schedulerInfo, runNow, reloadCrons } from '../scheduler/jobs.js';
+import { registerBrandKitRoutes } from './brand-kit-routes.js';
 import { approvedDrafts } from '../xhs/publish.js';
 import { exportCorpusZip, importCorpusZip } from '../corpus/transfer.js';
 import { createZip, type ZipEntryInput } from '../util/zip.js';
@@ -68,6 +69,9 @@ export async function buildServer() {
   const app = Fastify({ logger: false, bodyLimit: 5 * 1024 * 1024 });
 
   await app.register(cors, { origin: true });
+
+  // 模板调整（品牌套件）：自然语言 + 素材上传 + 预览
+  await registerBrandKitRoutes(app);
 
   /* ---------------- 系统状态 ---------------- */
 
