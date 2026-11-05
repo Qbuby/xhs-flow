@@ -113,7 +113,12 @@ export function describeBrandKitDiff(
 ): BrandKitDiff[] {
   if (!kit) return [];
   const out: BrandKitDiff[] = [];
-  if (kit.brandName?.trim()) {
+  // 只列**真的改变**的字段。逐字相同的覆盖没有信息量 ——
+  // 实测把副行文案原样填一遍，界面会显示「→ 同一个值」，看起来像没生效。
+  const same = (a: string | undefined, b: string): boolean =>
+    (a ?? '').trim() === b.trim();
+
+  if (kit.brandName?.trim() && !same(current.brandName, kit.brandName)) {
     out.push({
       field: 'brandName',
       label: '品牌署名',
@@ -121,7 +126,7 @@ export function describeBrandKitDiff(
       to: kit.brandName.trim(),
     });
   }
-  if (kit.brandTagline?.trim()) {
+  if (kit.brandTagline?.trim() && !same(current.brandTagline, kit.brandTagline)) {
     out.push({
       field: 'brandTagline',
       label: '副行文案',
@@ -137,7 +142,7 @@ export function describeBrandKitDiff(
       to: kit.logoDark?.originalName || kit.logoLight?.originalName || '已上传',
     });
   }
-  if (kit.accent?.trim()) {
+  if (kit.accent?.trim() && !same(current.accent, kit.accent)) {
     out.push({
       field: 'accent',
       label: '强调色',

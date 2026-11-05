@@ -167,18 +167,42 @@ function cover(input: LayoutInput): string {
   const lines = Math.max(1, mainTitle.length === 0 ? 1 : Math.ceil(mainTitle.length / 13));
   const titleSize = lines >= 3 ? Math.round(spec.type.display * 0.62) : lines === 2 ? Math.round(spec.type.display * 0.82) : spec.type.display;
 
-  // 蓝底白字块：原账号 bbox 71..679 × 420..600 → 宽约 609px、高 180px、
-  // 左对齐、文字约 110px。宽度按文字长度撑（max 62%），内边距上下均匀。
-  // [[ ]] 标记同样走 rich()：蓝块整块已是强调，模型若再标 [[ ]] 也不该
-  // 露出字面括号（smoke 曾抓到 [[新趋势]] 直接印在块里）。
-  const blockFont = Math.round(spec.type.display * 0.92);
+  /**
+   * 蓝底白字块。
+   *
+   * 原账号 bbox 71..679 × 420..600 → 宽约 609px、高 180px、左对齐、字约 110px。
+   *
+   * ⚠️ 宽度必须按文字长度算并留足余量，不能只靠 inline-block 自适应：
+   * 它是 flex 子项，宽度会被父容器的可用宽卡住，于是长一点的文案就在
+   * 块内折行、留下一个孤字（实测「品牌靠什么出圈」折成「品牌靠什么出」+「圈」，
+   * 最后一行只有一个字，视觉上像排版事故）。
+   * 这里：字号按字长自适应，宽度给到能装下一整行的最小值，并且不折行。
+   */
+  const BLOCK_MAX_W = 609; // 原图实测宽
+  // 1080 是本页画布宽（cards.ts 的 CARD_WIDTH）；layouts 不 import 它，
+  // 避免与 cards.ts 形成循环依赖，所以这里直接用常量。
+  const contentW = 1080 - spec.density.paddingX * 2;
+  const blockAvailW = Math.min(BLOCK_MAX_W, contentW);
+  const padX = Math.round(spec.type.display * 0.46);
+  // 先按原字号算，装不下就等比缩到能一行放下
+  let blockFont = Math.round(spec.type.display * 0.92);
+  const textW = blockTitle.length * blockFont;
+  if (textW + padX * 2 > blockAvailW) {
+    blockFont = Math.max(
+      Math.round(spec.type.display * 0.38),
+      Math.floor((blockAvailW - padX * 2) / Math.max(1, blockTitle.length)),
+    );
+  }
+  const blockPadX = Math.round(blockFont * 0.5);
+  const blockPadY = Math.round(blockFont * 0.32);
   const blockHtml = blockTitle
     ? `<div style="display:inline-block;align-self:flex-start;
+        max-width:${blockAvailW}px;
         background:var(--accent);color:var(--on-accent);
-        padding:${Math.round(blockFont * 0.32)}px ${Math.round(blockFont * 0.5)}px;
+        padding:${blockPadY}px ${blockPadX}px;
         margin:26px 0 34px">
         <span style="font-size:${blockFont}px;font-weight:800;line-height:1.15;
-          letter-spacing:0;display:block">${rich(blockTitle, spec)}</span>
+          letter-spacing:0;display:block;white-space:nowrap">${rich(blockTitle, spec)}</span>
       </div>`
     : '';
 

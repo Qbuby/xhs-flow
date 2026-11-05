@@ -15,6 +15,8 @@ import {
   isBrandKitActive,
 } from '../visual/templates/brand-kit.js';
 import { prepareBrandLogo, clearBrandKitAssets } from '../visual/templates/brand-kit-assets.js';
+import { familyStatuses } from '../visual/templates/registry.js';
+import { EXTRACTOR_VERSION } from '../visual/evidence/extract.js';
 import {
   getBrandKit,
   overlayBrandKit,
@@ -43,7 +45,17 @@ import { MEDIA_DIR } from '../config.js';
  * 所以预览接受一个**临时套件**参数，只在内存里叠加后渲染。
  */
 
-/** 从风格画像里取模板族的身份基线（用于展示「从什么变成什么」）。 */
+/**
+ * 从风格画像里取模板族的身份基线（用于展示「从什么变成什么」）。
+ *
+ * 【family 为什么不能只读 profile】
+ * `style_profiles.profile.card_template_spec.account_template` 是早期聚合写下的，
+ * 那时 schema 里还没有 family 字段 —— 所以库里存的是「无 family」的旧对象，
+ * 直接读会得到兜底值 generic-enum-v1，界面因此显示错误的族名（实测如此）。
+ *
+ * 真实族在 `page_evidence`（逐页像素分类 + 原文回放验收）里。
+ * 所以这里以注册表为准，profile 只用来取品牌文字。
+ */
 function templateBaseline(sourceId: number): {
   brandName: string;
   brandTagline: string;
@@ -54,12 +66,19 @@ function templateBaseline(sourceId: number): {
   const prof = getStyleProfile(sourceId)?.profile;
   const raw = (prof?.card_template_spec ?? {}) as Record<string, unknown>;
   const tpl = (raw.account_template ?? {}) as Record<string, unknown>;
+
+  // 以实测为准：取页数最多的已验证族
+  const families = familyStatuses(sourceId, EXTRACTOR_VERSION);
+  const top = families
+    .filter((f) => f.family !== 'unknown')
+    .sort((a, b) => b.pages - a.pages)[0];
+
   return {
     brandName: String(tpl.cover_header_text ?? ''),
     brandTagline: String(tpl.cover_header_sub ?? ''),
     accent: String(tpl.accent ?? ''),
     hasLogo: Boolean(tpl.logo_asset_dark || tpl.logo_asset_light),
-    family: String(tpl.family ?? 'generic-enum-v1'),
+    family: top?.family ?? 'generic-enum-v1',
   };
 }
 
