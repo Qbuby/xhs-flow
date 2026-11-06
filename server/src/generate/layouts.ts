@@ -3,6 +3,12 @@ import { badgeText, inlineMotif, type MotifContext } from './design/index.js';
 import { escapeHtml, highlightHtml } from './card-text.js';
 import { stripEmoji } from '../util/text.js';
 import { fitItems } from './design/fit.js';
+import {
+  renderComponent,
+  type ComponentCtx,
+  type ComponentData,
+  type ComponentKind,
+} from './design/components.js';
 
 /**
  * 文案 → 高亮 HTML。
@@ -59,6 +65,44 @@ export interface LayoutInput {
   pageNo: string;
   /** 主题给的行内装饰上下文 */
   motifCtx: MotifContext;
+  /**
+   * **这一页的构件配方**（可选）。
+   *
+   * 给了就按配方拼装，不给就走该版式的默认骨架。
+   *
+   * 【为什么需要】
+   * 一版式 = 一页的整块骨架，导致不管换多少版式，画出来都是
+   * 「一个大标题 + 一列字」—— 扫过去全是同一张图。
+   * 语料里一页是由 2~4 个构件按不同顺序堆出来的（见 design/components.ts）。
+   * 配方就是「这一页由哪几个构件、按什么顺序」——
+   * 它才是画面多样性的真正载体。
+   */
+  recipe?: PageRecipe;
+}
+
+/**
+ * 页配方：一页由哪些构件按什么顺序堆成。
+ *
+ * 每个条目告诉渲染器：这是第几个构件、构件类型、数据。
+ * 顺序即版面顺序（自上而下）。
+ */
+export interface RecipeStep {
+  kind: ComponentKind;
+  data?: ComponentData;
+  /** 该构件前的间距（px）。不给用默认节奏。 */
+  gap?: number;
+}
+
+/** 一页的构件配方。 */
+export interface PageRecipe {
+  steps: RecipeStep[];
+  /**
+   * 构件是否**纵向铺满**（有发丝线分隔的清单类）。
+   *
+   * 语料有两种节奏：清单类页面用发丝线把条目均匀铺到页脚上方，
+   * 而标题+引块类页面是「上面密、下面空」。这个开关控制要不要撑开。
+   */
+  fill?: boolean;
 }
 
 /** 只读的短横线分隔列表。 */
@@ -717,8 +761,160 @@ function cta(input: LayoutInput): string {
 }
 
 /* ------------------------------------------------------------------ */
+/* 构件配方                                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 按配方拼装一页。
+ *
+ * 【为什么配方渲染器住在 layouts.ts 而不是 components.ts】
+ * 因为配方需要知道「画布坐标」—— 标题落在 y=153 还是 y=266 是族特征，
+ * 而 components.ts 是纯构件（不知道自己在第几个）。
+ * 这里负责把「族的坐标」和「构件的内容」接起来。
+ */
+function renderRecipe(input: LayoutInput): string {
+  const { spec } = input;
+  const recipe = input.recipe!;
+  const family = spec.accountTemplate.family ?? 'generic-enum-v1';
+  const b = input.blocks;
+
+  /**
+   * 内容栏左边界（画布坐标）。
+   *
+   * 语料像素实测：26 页的内容左边界都在 x=96（344/1、344/2、371/1、
+   * 340/2、343/2 实测 94~96），右边界到 984，栏宽 888。
+   *
+   * 但旧代码把 `calc(69px - var(--pad-x))` 当成了内容栏 ——
+   * 69 其实是**大号浅蓝编号**的 x 位置（339/1 实测 69..198），
+   * 被误用到了正文上。实测我们的成图左边界只有 x=70/74/76，
+   * 整整偏了 20~26px，这也是"一眼不像"的原因之一。
+   *
+   * 所以配方渲染器统一用 96；`--pad-x` 是密度参数，不该决定几何基准。
+   */
+  const CONTENT_X = 96;
+  const left = `calc(${CONTENT_X}px - var(--pad-x, 0px))`;
+
+  const ctx: ComponentCtx = {
+    spec,
+    accent: spec.accountTemplate.accent || 'var(--accent)',
+    pageNo: input.pageNo,
+  };
+
+  /**
+   * 族的首屏元素坐标。
+   *
+   * 与 innerBody 的 FAMILY_TOP 同源 —— 同一个族，标题起排位置必须一致，
+   * 否则同一篇里两页的标题不在一条基线上，一眼就看出是拼的。
+   */
+  const FAMILY_TOP: Record<string, { title: number; body: number }> = {
+    'wow-brand-case-v1': { title: 266, body: 475 },
+    'wow-title-top-v1': { title: 153, body: 380 },
+    'wow-blue-tag-v1': { title: 220, body: 400 },
+  };
+  const top = FAMILY_TOP[family];
+
+  // 封面页不套配方（封面有自己专门的骨架）
+  const steps = recipe.steps.filter((s) => s.kind !== 'headline' && s.kind !== 'eyebrow');
+
+  const parts: string[] = [];
+
+  // eyebrow 与 headline 由配方指定位置
+  const eyebrowStep = recipe.steps.find((s) => s.kind === 'eyebrow');
+  const headlineStep = recipe.steps.find((s) => s.kind === 'headline');
+
+  /**
+   * 【为什么用流式布局，而不是给每个构件一个绝对 y】
+   *
+   * 一开始试过按 `calc(坐标 - var(--pad-top))` 逐个落位，构件高度靠估算，
+   * 结果内容稍长就叠在一起或掉到页脚下面 —— 估算永远不准。
+   * 现在改成：整块内容用 padding 把**首屏**落到族坐标（标题 y=153/266/220），
+   * 之后构件按 gap 自然往下流。这样既保留了族的标题起排，又不会溢出。
+   *
+   * 首屏坐标：eyebrow 在标题上方 ~70px；没有 eyebrow 时标题直接落位。
+   */
+  const firstY = top?.title ?? 200;
+  const startPad = eyebrowStep ? Math.max(60, firstY - 70) : firstY;
+  const padTop = `calc(${startPad}px - var(--pad-top, 0px))`;
+
+  if (eyebrowStep) {
+    parts.push(`<div style="margin:0 0 26px">
+      ${renderComponent('eyebrow', eyebrowStep.data ?? {}, ctx)}</div>`);
+  }
+  if (headlineStep) {
+    parts.push(`<div style="margin:0 0 20px">
+      ${renderComponent('headline', headlineStep.data ?? {}, ctx)}</div>`);
+  }
+
+  // 其余构件：按 gap 自然往下流
+  for (const [i, step] of steps.entries()) {
+    const html = renderComponent(step.kind, step.data ?? {}, ctx);
+    if (!html) continue;
+    const gap = step.gap ?? (i === 0 ? 0 : 34);
+    parts.push(`<div style="margin:${gap}px 0 0">${html}</div>`);
+  }
+
+  // 清单类要铺满整页（语料里条目用发丝线均匀分布到页脚上方）
+  const fill = recipe.fill
+    ? `display:flex;flex-direction:column;height:100%;`
+    : `display:flex;flex-direction:column;`;
+
+  return `
+    <div style="padding:${padTop} ${left} 0;box-sizing:border-box;${fill}min-height:0">
+      ${parts.join('\n')}
+      ${recipe.fill ? '<div style="flex:1"></div>' : ''}
+    </div>`;
+}
+
+/**
+ * 粗估一个构件的高度（px）。
+ *
+ * 保留给调用方做容量判断用；流式布局不再依赖它定位。
+ */
+function estimateHeight(step: RecipeStep, ctx: ComponentCtx): number {
+  const d = step.data ?? {};
+  const spec = ctx.spec;
+  switch (step.kind) {
+    case 'subhead':
+      return Math.round(spec.type.title * 0.5 * 1.35) + 20;
+    case 'sectionBox':
+      return 84 + 24;
+    case 'numberedRow':
+      return (d.items?.length ?? 0) * 96;
+    case 'bulletList':
+    case 'listItem':
+      return (d.items?.length ?? 0) * (spec.density.gap * 0.6 * 2 + 92);
+    case 'tagGrid': {
+      const n = d.tags?.length ?? 0;
+      const cols = n > 4 ? 3 : 2;
+      return Math.ceil(n / cols) * 100 + 20;
+    }
+    case 'arrowMap':
+      return (d.items?.length ?? 0) * 96;
+    case 'dualBubble':
+    case 'darkPair':
+      return 300;
+    case 'panelStack':
+      return 320;
+    case 'quotePanel':
+      return Math.round(spec.type.title * 0.46 * 1.55) + 60;
+    case 'screenshot':
+      return 560;
+    case 'hairline':
+      return 1;
+    case 'closingLine':
+      return 60;
+    default:
+      return 80;
+  }
+}
+
+/* ------------------------------------------------------------------ */
 
 export function layoutBody(layout: string, input: LayoutInput): string {
+  // 有配方就按配方拼装（这是画面多样性的主路径）
+  if (input.recipe && input.recipe.steps.length > 0 && layout !== 'cover') {
+    return renderRecipe(input);
+  }
   switch (layout) {
     case 'cover':
       return cover(input);

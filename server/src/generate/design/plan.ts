@@ -335,8 +335,8 @@ function sameRoles(a: string, b: string): boolean {
   return a.replace(/[^a-z_]/g, '') === b.replace(/[^a-z_]/g, '');
 }
 
-/** 稳定字符串哈希（用于按选题挑补位节拍）。 */
-function hashOf(s: string): number {
+/** 稳定字符串哈希（用于按选题挑补位节拍 / 挑页面配方）。 */
+export function hashOf(s: string): number {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) {
     h ^= s.charCodeAt(i);

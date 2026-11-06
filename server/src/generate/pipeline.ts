@@ -14,6 +14,10 @@ import {
   type DeckPlan,
 } from './design/plan.js';
 import {
+  pickRecipe,
+  type RecipeId,
+} from './design/recipes.js';
+import {
   corpusGenreDistribution,
   detectGenre,
   GENRE_SPECS,
@@ -440,21 +444,33 @@ export async function composeDraft(opts: {
   const draftId = Number(ins.lastInsertRowid);
 
   /**
-   * 逐张卡片的模板族来自计划。
+   * 逐张卡片的模板族 + **页面配方**。
    *
-   * 关键点：**版式（list/steps/compare）与模板族（wow-brand-case-v1 等）
-   * 是两个正交的维度**。版式决定「这页放什么内容」，模板族决定「这页长什么样」
-   * （编号形态、标题起排 y、页脚条）。之前整篇共用一个族，所以每篇都长得一样。
+   * 三个正交维度：
+   *   - 版式（list/steps/compare）决定「这页放什么内容」
+   *   - 模板族（wow-brand-case-v1 等）决定「编号形态、标题起排 y、页脚条」
+   *   - 配方（L1..L10）决定「这页由哪几个构件按什么顺序堆成」
+   *
+   * 之前只有前两个，所以不管换多少版式，画出来都是「大标题 + 一列字」。
+   * 语料普查 26/26 页的构件序列都不重复 —— 配方才是画面多样性的载体。
    */
-  const cards: Card[] = draft.cards.slice(0, 10).map((c, i) => ({
-    layout: c.layout,
-    blocks: { ...c.blocks, brand },
-    family: plan?.families[i],
-  }));
+  const usedRecipes: RecipeId[] = [];
+  const cards: Card[] = draft.cards.slice(0, 10).map((c, i) => {
+    // 封面有专门骨架，不套配方
+    const recipeId =
+      c.layout === 'cover' ? null : pickRecipe(c.layout, topic, i, usedRecipes, genre);
+    if (recipeId) usedRecipes.push(recipeId);
+    return {
+      layout: c.layout,
+      blocks: { ...c.blocks, brand },
+      family: plan?.families[i],
+      recipeId,
+    };
+  });
 
   cards.forEach((c, i) => {
     run(
-      'INSERT INTO draft_cards(draft_id, idx, layout, content, photo_url, family) VALUES (?,?,?,?,?,?)',
+      'INSERT INTO draft_cards(draft_id, idx, layout, content, photo_url, family, recipe_id) VALUES (?,?,?,?,?,?,?)',
       draftId,
       i,
       c.layout,
@@ -463,6 +479,7 @@ export async function composeDraft(opts: {
       // 不再是模型的检索词 —— 免费图库是「无关的免费图」问题的根源。
       null,
       c.family ?? null,
+      c.recipeId ?? null,
     );
   });
 
@@ -621,8 +638,9 @@ export async function renderDraftCards(draftId: number, sourceId: number | null)
     content: string;
     photo_url: string | null;
     family: string | null;
+    recipe_id: string | null;
   }>(
-    'SELECT id, layout, content, photo_url, family FROM draft_cards WHERE draft_id = ? ORDER BY idx',
+    'SELECT id, layout, content, photo_url, family, recipe_id FROM draft_cards WHERE draft_id = ? ORDER BY idx',
     draftId,
   );
 
@@ -666,6 +684,8 @@ export async function renderDraftCards(draftId: number, sourceId: number | null)
       family: (r.family as TemplateFamilyId) ?? undefined,
       // 编号前缀按计划来：只有细字编号族用得上
       numberingPrefix: planPrefix || undefined,
+      // 页配方：这一页由哪几个构件按什么顺序堆成
+      recipeId: (r.recipe_id as RecipeId) ?? null,
     };
   });
 

@@ -183,6 +183,9 @@ export const MIGRATIONS: string[] = [
   ALTER TABLE draft_cards ADD COLUMN family TEXT;         -- 该页的模板族（逐页不同）
   `,
   `
+  ALTER TABLE draft_cards ADD COLUMN recipe_id TEXT;      -- 该页的构件配方（L1..L10）
+  `,
+  `
   ALTER TABLE drafts ADD COLUMN plan TEXT;                -- JSON：计划摘要（复现与去重用）
   `,
 

@@ -36,6 +36,7 @@ import {
 import { brandKitAssetDataUriSync } from '../visual/templates/brand-kit-assets.js';
 import { getBrandKit, overlayBrandKit } from '../visual/templates/brand-kit-store.js';
 import { isBrandKitActive } from '../visual/templates/brand-kit.js';
+import { buildPageRecipe, type RecipeId } from './design/recipes.js';
 
 /**
  * 卡片渲染器。
@@ -130,6 +131,13 @@ export interface Card {
    * （wow-brand-case-v1）会用到；其它族的编号是纯数字。
    */
   numberingPrefix?: string;
+  /**
+   * **本页的构件配方**（L1..L10，见 design/recipes.ts）。
+   *
+   * 有配方就按配方把构件拼成一页，不给就走该版式的默认整块骨架。
+   * 语料普查 26/26 页的构件序列都不重复 —— 配方是画面多样性的载体。
+   */
+  recipeId?: RecipeId | null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -598,6 +606,16 @@ function accountPageNumber(
   if (t.numbering === 'none') return '';
   const style = FAMILY_NUMBERING[t.family ?? 'generic-enum-v1'];
 
+  /**
+   * 编号形态为 none 的族**不画编号**。
+   *
+   * ⚠️ 这个分支必须显式写，不能靠 fallthrough。
+   * wow-title-top-v1 的编号形态就是 'none'（342/1 实测：标题直接置顶，
+   * 整页无页码）。少了这一行，title-top 会掉进下面的「大号浅蓝数字」
+   * 分支，把 88px 的 02 画在 y=161 —— 正好压在大标题上（实测成图确认）。
+   */
+  if (style === 'none') return '';
+
   // blue-tag：顶部蓝底反白标签 + 白字（357/2 实测 bbox 99..324 × 99..166，
   // 约 226×68px）。标签本身即章节标记，不再叠加页码。
   if (style === 'blue-tag') {
@@ -707,6 +725,10 @@ export function buildCardHtml(
     blocks: b,
     spec: pageSpec,
     photoDataUri,
+    // 有配方就按构件拼装，这一页的画面构成由它决定
+    recipe: card.recipeId
+      ? buildPageRecipe(card.recipeId, b, pageNo)
+      : undefined,
     pageNo,
     motifCtx,
   });
