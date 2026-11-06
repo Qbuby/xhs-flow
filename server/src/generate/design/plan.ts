@@ -1,6 +1,7 @@
 import { all } from '../../db/index.js';
 import { EXTRACTOR_VERSION } from '../../visual/evidence/extract.js';
 import { titleSimilarity } from '../../util/text-sim.js';
+import { detectGenre, type Genre } from './genre.js';
 import type { TemplateFamilyId } from './contract.js';
 
 /**
@@ -429,11 +430,13 @@ export function rolesFromPlan(
  * @param sourceId   来源
  * @param topic      本篇选题（用于挑样稿与补位节拍）
  * @param preferIds  优先采用的样稿 id 列表（通常是检索命中的那些）
+ * @param genre      本篇体裁。给了就优先挑同体裁的样稿当骨架来源。
  */
 export function buildDeckPlan(
   sourceId: number,
   topic: string,
   preferIds: number[] = [],
+  genre?: Genre,
 ): DeckPlan | null {
   const notes = corpusNotes(sourceId);
   if (notes.length === 0) return null;
@@ -442,15 +445,15 @@ export function buildDeckPlan(
   const recent = recentPlanSignatures(sourceId);
 
   /**
-   * 候选排序：**按与选题的相关度**，不是按互动量。
+   * 候选排序：**本体裁优先 + 选题相关度**，不是按互动量。
    *
    * 之前是「检索命中的优先，否则按互动量降序」，于是同一来源天天都挑中
    * 同一篇爆款当样稿 —— 骨架、页数、内页族全跟着那篇走，这就是
-   * 「每篇都很雷同」的根因。实测连造 12 份计划，12 份完全相同。
+   * 「每篇都很雷同」的根因之一。实测连造 12 份计划时 12 份完全相同。
    *
-   * 现在改成：相关度打分 → 取前 K 篇作为候选池 → 在池内挑第一个
-   * 与近期计划不冲突的。所以同一个选题附近的结构相近、不同选题结构不同，
-   * 且连续创作时会自然轮换。
+   * 再往上一层：即使骨架变了，如果样稿总是"现象归因"类，
+   * 写出来的还是同一个文体。所以**同体裁的样稿优先**，
+   * 让"教程"的稿子照着语料里的教程写、让"概念辨析"照着辨析写。
    */
   const prefer = new Set(preferIds);
   const scored = notes
@@ -459,7 +462,13 @@ export function buildDeckPlan(
       let titleScore = titleSimilarity(topic, n.title);
       // 检索命中是强信号（FTS 已经判过相关），给一个显著加成但不独占
       if (prefer.has(n.id)) titleScore = Math.max(titleScore, 0.5);
-      return { note: n, score: titleScore };
+      // 同体裁是**更强**的信号：直接决定正文组织方式
+      const sameGenre = genre ? detectGenre(n.title) === genre : false;
+      return {
+        note: n,
+        score: titleScore + (sameGenre ? 0.45 : 0),
+        sameGenre,
+      };
     })
     .sort((a, b) => b.score - a.score || b.note.liked_count - a.note.liked_count);
 

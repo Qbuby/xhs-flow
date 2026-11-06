@@ -121,6 +121,11 @@ export const MIGRATIONS: string[] = [
   );
   CREATE INDEX IF NOT EXISTS idx_topics_status ON topics(source_id, status);
   `,
+  /* 体裁：一篇笔记"在干什么"（教程/辨析/趋势/单案…）。
+     选题时按语料分布补齐缺的体裁，避免成片都是"为什么…"。 */
+  `
+  ALTER TABLE topics ADD COLUMN genre TEXT;
+  `,
 
   /* ---------- 草稿 ---------- */
   `

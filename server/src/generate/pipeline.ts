@@ -14,6 +14,12 @@ import {
   type DeckPlan,
 } from './design/plan.js';
 import {
+  corpusGenreDistribution,
+  detectGenre,
+  GENRE_SPECS,
+  type Genre,
+} from './design/genre.js';
+import {
   corpusPhotoPool,
   pickCorpusPhoto,
 } from '../visual/templates/corpus-photo-match.js';
@@ -287,6 +293,8 @@ export async function composeDraft(opts: {
   brief?: string;
   brand?: string;
   cardCount?: number;
+  /** 本篇的体裁（来自选题）。不传就按标题自动判。 */
+  genre?: Genre;
 }): Promise<ComposeResult> {
   const { sourceId, topic, angle, brief, brand = '' } = opts;
 
@@ -294,21 +302,39 @@ export async function composeDraft(opts: {
   const examples = retrieveWithFallback(`${topic} ${angle ?? ''}`, sourceId, 4);
 
   /**
+   * 本篇的体裁。
+   *
+   * 体裁决定**正文怎么组织**，比"风格档案"里的抽象描述更有效 ——
+   * 画像只会说"克制理性、结论先行"，而体裁会直接说
+   * "按步骤讲清怎么做" / "把两个概念摆开给边界"。
+   *
+   * 这也是「每篇雷同」的解药之一：语料里 19% 是教程、13% 是概念辨析，
+   * 成稿里却只剩 10% / 1%，因为提示词从来没让模型写过那些文体。
+   */
+  const genre: Genre = opts.genre ?? detectGenre(topic);
+  const genreSpec = GENRE_SPECS[genre];
+
+  /**
    * 施工计划：页数 + 骨架 + 逐页版式 + 逐页模板族，全部取自语料。
    *
    * 没有计划（语料还没蒸馏）时退回固定 7 卡 —— 但那种情况下本来也
    * 复刻不了模板，渲染阶段会被生产闸门拦住。
+   *
+   * 传体裁进去：骨架挑选会优先找**同一体裁**的样稿，
+   * 免得"教程"的稿子照着"现象归因"的骨架写。
    */
   const plan = buildDeckPlan(
     sourceId,
     topic,
     examples.map((e) => e.notePk),
+    genre,
   );
 
   const cardCount = plan?.cardCount ?? opts.cardCount ?? 7;
 
   const user = [
     `【本次选题】${topic}`,
+    `【本篇体裁】${genreSpec.name}`,
     angle ? `【切入角度】${angle}` : '',
     brief ? `【补充要求】${brief}` : '',
     brand ? `【品牌署名】页脚署名用「${brand}」` : '',
@@ -332,12 +358,18 @@ export async function composeDraft(opts: {
     '- photo_text：title + subtitle（配图由系统按内容匹配语料案例图，你不用给检索词）',
     '- cta：title + action(引导语)',
     '',
+    `【本篇体裁：${genreSpec.name} —— 正文必须按这个文体写】`,
+    genreSpec.bodyGuide,
+    `⚠️ 这一条比"模仿博主的语气"更优先：语料里这个体裁占了一定的比例，` +
+      `而你之前几乎只写"为什么…"这一种。这次请真的按「${genreSpec.name}」来组织内容。`,
+    '',
     '【文案品质要求 —— 每一条都要做到】',
     '- 正文用 \\n\\n 分成 3-6 段，段间空一行；不要写成一整块连续文字',
     '- 全文（含卡片）**不要出现任何 emoji**',
     '- 不写"绝绝子/宝藏/yyds/赋能/抓手"这类词',
     '- 至少给出 2 个具体可验证的结论（数字、判断标准、取舍代价）',
     '- **不要写"语言体系""视觉规范""方法论"这种抽象大词当标题** —— 标题要落到具体的东西上',
+    '- **不要每张卡都用"不是A而是B"的句式** —— 那是语料里的一种修辞，不是唯一修辞',
     '',
     '【最重要的要求】严格按下面这份 JSON 结构输出。',
     '每张卡片的文案字段必须**嵌套在 blocks 对象内**，不要平铺到卡片对象上。',
@@ -703,15 +735,39 @@ SEO、关键词布局…）。这些不属于这位博主的业务，写出来�
 【选题的质量标准 —— 对齐爆款的写法】
 参考给你的「爆款样稿」，它们的共同点是：
 - 命题具体，不空泛（"喜茶为什么越看越有感觉" > "分析喜茶的成功"）
-- 常带具体对象、数字、反直觉（"韩国小品牌为啥看起来很完整"、"初创品牌如何制造早就很火的感觉"）
-- 用提问或判断句，不写陈述式标题
-- 站在品牌从业者视角，讲判断和方法，不讲操作步骤
+- 常带具体对象、数字、反直觉
+- 站在品牌从业者视角
+
+【⚠️ 体裁必须分散 —— 这是最重要的一条】
+这位博主的语料里，体裁分布是这样的（实测 118 篇）：
+
+  教程/SOP   19%   「品牌手册怎么写，一篇讲清楚」
+  现象归因    14%   「为什么现在的品牌，都在卖情绪」
+  概念辨析    13%   「品牌和营销，根本不是一回事」
+  趋势断言    11%   「全民进入"过日子"时代，品牌还在卷高级感」
+  单案深拆     8%   「喜茶为什么越看越有感觉」
+  清单        9%   「小品牌别乱做视觉，先找到自己的方向」
+  合集盘点     9%   「2026上半年出圈的品牌，都在用这套逻辑」
+  观点断言    17%   「产品卖的不是产品，而是情绪价值」
+
+你之前一直只写「为什么…」这一类，导致 45% 的稿子都是同一个文体。
+这次给你的每个选题都**指定了体裁**，必须严格按指定体裁写标题：
+
+  tutorial   → 动作主张+交付：「X 怎么写，一篇讲清楚」「X 的 5 个步骤，顺序别乱」
+  concept    → 概念+追问：「X 到底是什么」「X 和 Y，根本不是一回事」
+  trend      → 变化+断言：「品牌正在 X」「X 时代结束了」
+  casestudy  → 品牌名+反常：「X 为什么越看越有感觉」「X 做对了什么」
+  roundup    → 范围/N个+共性：「上半年出圈的品牌，都在用这套逻辑」
+  checklist  → N 个+场景：「小品牌别乱做视觉，先找到方向」
+  why        → 为什么+具体现象（⚠️ 别每题都用）
+  thesis     → 直接给判断，不提问：「产品卖的不是产品，而是情绪价值」
 
 【禁止】
 - 与已写过的选题重复或只是换词
 - 标题里带 [[方括号]] 标记（那是渲染标记，不该出现在选题里）
 - emoji
-- 任何与品牌业务无关的运营/流量/工具类选题`;
+- 任何与品牌业务无关的运营/流量/工具类选题
+- **所有选题都用同一个句式**`;
 
 /**
  * 从模型返回里挖出选题数组。
@@ -723,8 +779,8 @@ SEO、关键词布局…）。这些不属于这位博主的业务，写出来�
  *
  * 这里按「数组候选键 × 标题候选字段」两级容错，并兜底嵌套一层与「顶层单条」。
  */
-function extractTopics(raw: unknown): Array<{ title: string; angle: string; brief: string }> {
-  const out: Array<{ title: string; angle: string; brief: string }> = [];
+function extractTopics(raw: unknown): Array<{ title: string; angle: string; brief: string; genre?: Genre }> {
+  const out: Array<{ title: string; angle: string; brief: string; genre?: Genre }> = [];
   if (!raw || typeof raw !== 'object') return out;
   const root = raw as Record<string, unknown>;
 
@@ -732,6 +788,7 @@ function extractTopics(raw: unknown): Array<{ title: string; angle: string; brie
   const TITLE_KEYS = ['title', '选题标题', '标题', 'topic', 'name'];
   const ANGLE_KEYS = ['angle', '切入角度', '角度'];
   const BRIEF_KEYS = ['brief', '内容要求', '说明', '核心创意', 'desc', 'description'];
+  const GENRE_KEYS = ['genre', '体裁', '类型'];
 
   const pickStr = (obj: Record<string, unknown>, keys: string[]): string => {
     for (const k of keys) {
@@ -748,7 +805,13 @@ function extractTopics(raw: unknown): Array<{ title: string; angle: string; brie
       const o = item as Record<string, unknown>;
       const title = pickStr(o, TITLE_KEYS);
       if (!title) continue;
-      out.push({ title, angle: pickStr(o, ANGLE_KEYS), brief: pickStr(o, BRIEF_KEYS) });
+      const genreRaw = pickStr(o, GENRE_KEYS).toLowerCase();
+      out.push({
+        title,
+        angle: pickStr(o, ANGLE_KEYS),
+        brief: pickStr(o, BRIEF_KEYS),
+        ...(isGenre(genreRaw) ? { genre: genreRaw } : {}),
+      });
     }
     if (out.length > 0) return out;
   }
@@ -762,8 +825,21 @@ function extractTopics(raw: unknown): Array<{ title: string; angle: string; brie
   }
   // 兜底二：顶层本身就是一条选题
   const single = pickStr(root, TITLE_KEYS);
-  if (single) return [{ title: single, angle: pickStr(root, ANGLE_KEYS), brief: pickStr(root, BRIEF_KEYS) }];
+  if (single) {
+    const genreRaw = pickStr(root, GENRE_KEYS).toLowerCase();
+    return [{
+      title: single,
+      angle: pickStr(root, ANGLE_KEYS),
+      brief: pickStr(root, BRIEF_KEYS),
+      ...(isGenre(genreRaw) ? { genre: genreRaw } : {}),
+    }];
+  }
   return out;
+}
+
+/** 模型回填的体裁是合法值吗。 */
+function isGenre(v: string): v is Genre {
+  return ['tutorial', 'concept', 'trend', 'casestudy', 'roundup', 'checklist', 'why', 'thesis'].includes(v);
 }
 
 export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{ title: string; angle: string; brief: string }>> {
@@ -815,6 +891,57 @@ export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{
     ? profile.topic_map.map((t) => `- ${t.topic}（${t.note_count} 篇 / 均赞 ${t.avg_liked}）`).join('\n')
     : '（无历史分布）';
 
+  /**
+   * 体裁分配 —— 这是「每篇雷同」的直接解法。
+   *
+   * 先算近 12 篇成稿的体裁分布，再按语料的真实占比找出**欠配最多**的体裁，
+   * 给这一批选题逐条指定。这样连着写 6 篇，体裁会自然铺开而不是全挤在「为什么…」。
+   *
+   * 为什么不按概率随机：小样本上会偏斜（连抽 3 个 why 并不罕见），
+   * 而"欠得最多就补哪个"是确定性的、可解释的。
+   */
+  const recentDraftGenres = all<{ title: string }>(
+    'SELECT title FROM drafts WHERE source_id = ? ORDER BY id DESC LIMIT 12',
+    sourceId,
+  ).map((r) => detectGenre(r.title));
+
+  const genreDist = corpusGenreDistribution(sourceId);
+  // 这一批要覆盖的体裁：按缺口从大到小排，取前 count 个（不够就按占比补）
+  const slots: Genre[] = [];
+  {
+    const window = recentDraftGenres;
+    const ranked = genreDist.counts
+      .map((c) => ({
+        genre: c.genre,
+        gap: c.ratio * Math.max(window.length, 6) - window.filter((g) => g === c.genre).length,
+      }))
+      .sort((a, b) => b.gap - a.gap);
+    for (const r of ranked) {
+      if (slots.length >= count) break;
+      slots.push(r.genre);
+    }
+    // 语料分布的条目比 count 少时，按占比循环补
+    let i = 0;
+    while (slots.length < count && genreDist.counts.length > 0) {
+      slots.push(genreDist.counts[i % genreDist.counts.length]!.genre);
+      i++;
+    }
+  }
+
+  const genreBrief = slots
+    .map((g, i) => {
+      const s = GENRE_SPECS[g];
+      const ex = genreDist.counts.find((c) => c.genre === g)?.examples ?? [];
+      return [
+        `  ${i + 1}. 体裁=${s.name}（${g}）`,
+        `     标题写法：${s.titleGuide}`,
+        ex.length ? `     语料里这类标题的例子：${ex.map((e) => `「${e}」`).join('、')}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+    })
+    .join('\n');
+
   const raw = await chatJson<Record<string, unknown>>({
     system: IDEATE_SYSTEM,
     user: [
@@ -827,6 +954,14 @@ export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{
       '【题材的历史表现】',
       topicBlock,
       '',
+      `【她的语料里，各体裁的真实占比（实测 ${genreDist.total} 篇）】`,
+      ...genreDist.counts.map((c) => `  ${c.name.padEnd(6)} ${String(c.count).padStart(3)} 篇  ${(c.ratio * 100).toFixed(0)}%`),
+      '',
+      '【她最近 12 篇成稿的体裁】',
+      recentDraftGenres.length
+        ? recentDraftGenres.map((g) => GENRE_SPECS[g].name).join('、')
+        : '（还没有成稿）',
+      '',
       '【她的爆款样稿 —— 照着这个写法和命题颗粒度】',
       winners || '（无）',
       '',
@@ -838,12 +973,15 @@ export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{
       '"AI一键做Logo品牌反而更难认"（这是工具评测，不是品牌命题）、',
       '以及任何关于流量、涨粉、投放、私域、SEO 的题目。',
       '',
-      `【任务】产出 ${count} 个新选题，覆盖 2 个以上不同题材。`,
-      '每条要求：',
-      '  title — 20 字以内，提问句或判断句，具体到能配 5-8 张图',
+      `【任务】产出 ${count} 个新选题，**每个选题的体裁已经给你指定了**，必须严格按对应的标题写法来：`,
+      genreBrief,
+      '',
+      '输出要求：',
+      '  title — 20 字以内，按上面指定的体裁写，具体到能配 5-8 张图',
       '  angle — 从哪个品牌命题切入',
       '  brief  — 这篇要讲清什么判断',
-      '输出 JSON：{"topics":[{"title":"…","angle":"…","brief":"…"}]}',
+      '  genre — 原样回填上面指定的体裁标识（如 tutorial / concept / trend）',
+      '输出 JSON：{"topics":[{"title":"…","angle":"…","brief":"…","genre":"…"}]}',
     ].join('\n'),
     temperature: 0.9,
     maxTokens: 8_192,
@@ -903,8 +1041,20 @@ export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{
   ).map((r) => r.title);
   const nearTitles = [...existingTitles, ...recentDraftTitles];
 
-  const accepted: Array<{ title: string; angle: string; brief: string }> = [];
+  const accepted: Array<{ title: string; angle: string; brief: string; genre: Genre }> = [];
   const rejected: Array<{ title: string; why: string }> = [];
+
+  /**
+   * 体裁配额：同一批选题里，任何一个体裁都不能超过一半。
+   *
+   * 提示词已经要求分散，但模型不保证守规矩 —— 实测它在给「必须按指定体裁」的
+   * 指令后仍会连写「为什么…」。所以这里做最后一道机械校验：
+   * 某个体裁在本批里已经占了 ceil(count/2) 篇，后面的同体裁选题直接拦下。
+   *
+   * 这不是"内容不好"，是"结构重复"—— 正是用户说的「每篇都很雷同」。
+   */
+  const genreCap = Math.max(2, Math.ceil(count / 2));
+  const genreUsed = new Map<Genre, number>();
 
   for (const t of topics) {
     const title = t.title.trim();
@@ -928,7 +1078,16 @@ export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{
       rejected.push({ title, why: `与已有标题近似：「${near}」` });
       continue;
     }
-    accepted.push({ ...t, title });
+
+    // 体裁以**实际标题**为准（模型的 genre 回填可能不准或被省略）
+    const genre: Genre = t.genre ?? detectGenre(title);
+    const used = genreUsed.get(genre) ?? 0;
+    if (used >= genreCap) {
+      rejected.push({ title, why: `体裁「${GENRE_SPECS[genre].name}」在本批已 ${used} 篇，超配额` });
+      continue;
+    }
+    genreUsed.set(genre, used + 1);
+    accepted.push({ ...t, title, genre });
   }
 
   if (rejected.length > 0) {
@@ -941,33 +1100,43 @@ export async function ideateTopics(sourceId: number, count = 6): Promise<Array<{
     );
   }
 
-  const inserted: Array<{ title: string; angle: string; brief: string }> = [];
+  const inserted: Array<{ title: string; angle: string; brief: string; genre: Genre }> = [];
 
   for (const t of accepted.slice(0, count)) {
     run(
-      `INSERT INTO topics(source_id, title, angle, brief, origin) VALUES (?,?,?,?, 'ai')`,
+      `INSERT INTO topics(source_id, title, angle, brief, genre, origin) VALUES (?,?,?,?,?, 'ai')`,
       sourceId,
       String(t.title).slice(0, 100),
       String(t.angle ?? ''),
       String(t.brief ?? ''),
+      t.genre,
     );
-    inserted.push({ title: t.title, angle: t.angle ?? '', brief: t.brief ?? '' });
+    inserted.push({ title: t.title, angle: t.angle ?? '', brief: t.brief ?? '', genre: t.genre });
   }
 
   return inserted;
 }
 
 /** 从待办选题里取一个来创作。 */
-export function claimTopic(sourceId: number): { id: number; title: string; angle: string; brief: string } | null {
-  const row = get<{ id: number; title: string; angle: string; brief: string }>(
-    `SELECT id, title, angle, brief FROM topics
+export function claimTopic(
+  sourceId: number,
+): { id: number; title: string; angle: string; brief: string; genre: Genre | null } | null {
+  const row = get<{
+    id: number;
+    title: string;
+    angle: string;
+    brief: string;
+    genre: string | null;
+  }>(
+    `SELECT id, title, angle, brief, genre FROM topics
      WHERE source_id = ? AND status = 'open'
      ORDER BY (origin = 'manual') DESC, id ASC LIMIT 1`,
     sourceId,
   );
   if (!row) return null;
   run("UPDATE topics SET status = 'queued' WHERE id = ?", row.id);
-  return row;
+  const genre = row.genre && isGenre(row.genre) ? row.genre : null;
+  return { ...row, genre };
 }
 
 export async function composeNextDraft(sourceId: number, brand = ''): Promise<ComposeResult | null> {
@@ -983,6 +1152,8 @@ export async function composeNextDraft(sourceId: number, brand = ''): Promise<Co
       angle: topic.angle,
       brief: topic.brief,
       brand,
+      // 体裁从选题带进创作：它会改变提示词给的正文组织要求（见 GENRE_SPECS）
+      genre: topic.genre ?? undefined,
     });
     run("UPDATE topics SET status='used', used_at=datetime('now') WHERE id = ?", topic.id);
     return res;

@@ -660,13 +660,14 @@ export async function buildServer() {
   /* ---------------- 生成 ---------------- */
 
   app.post('/api/compose', async (req, reply) => {
-    const { sourceId, topic, angle, brief, brand, cardCount } = (req.body ?? {}) as {
+    const { sourceId, topic, angle, brief, brand, cardCount, genre } = (req.body ?? {}) as {
       sourceId?: number;
       topic?: string;
       angle?: string;
       brief?: string;
       brand?: string;
       cardCount?: number;
+      genre?: string;
     };
     if (!sourceId || !topic) {
       reply.code(400);
@@ -684,6 +685,8 @@ export async function buildServer() {
         brief,
         brand: brand ?? getSetting('brand') ?? '',
         cardCount: cardCount ?? 7,
+        // 可选：显式指定体裁（不传则按标题自动判）
+        ...(typeof genre === 'string' ? { genre: genre as never } : {}),
       });
     } catch (err) {
       reply.code(500);
